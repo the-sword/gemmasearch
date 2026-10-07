@@ -1,35 +1,91 @@
 {
   "name": "gemma-search",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
+  "description": "本地优先的 Gemma 多模态语义搜索应用",
+  "author": "GemmaSearch maintainers",
+  "homepage": "https://huggingface.co/onnx-community/embeddinggemma-2-ONNX",
+  "desktopName": "GemmaSearch",
   "type": "module",
+  "main": "dist-electron/main.cjs",
   "scripts": {
     "dev": "vite",
-    "build": "npm run copy-ort && tsc -b && vite build",
+    "build": "npm run copy-ort && npm run build:electron && tsc -b && vite build",
+    "build:electron": "esbuild electron/main.ts electron/preload.ts --bundle --platform=node --format=cjs --outdir=dist-electron --external:electron --out-extension:.js=.cjs",
     "copy-ort": "node scripts/copy-ort.mjs",
+    "electron:dev": "npm run copy-ort && npm run build:electron && node scripts/electron-dev.mjs",
+    "dist:linux": "npm run build && electron-builder --linux AppImage deb --x64",
+    "dist:win": "node scripts/dist-win.mjs",
+    "dist:mac": "npm run build && electron-builder --mac dir --x64 --arm64 && node scripts/zip-mac.mjs",
     "typecheck": "tsc -b --pretty",
     "lint": "eslint .",
     "test": "vitest",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:run": "vitest run"
   },
-  "dependencies": {
+  "devDependencies": {
     "@huggingface/transformers": "^4.3.1",
+    "chokidar": "^4.0.3",
     "idb": "^8.0.4",
     "pdfjs-dist": "^6.4.299",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
-  },
-  "devDependencies": {
+    "react-dom": "^19.2.8",
     "@eslint/js": "^10.0.1",
     "@types/node": "^24.13.3",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
     "@vitejs/plugin-react": "^6.1.1",
+    "electron": "^44.6.0",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.27.7",
     "eslint": "^10.12.0",
     "oxlint": "^1.81.0",
     "typescript": "~6.0.2",
     "typescript-eslint": "^8.71.1",
     "vite": "^8.3.0",
     "vitest": "^5.0.3"
+  },
+  "build": {
+    "appId": "ai.gemmasearch.app",
+    "productName": "GemmaSearch",
+    "icon": "build/icon.png",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "linux": {
+      "maintainer": "GemmaSearch maintainers",
+      "syncDesktopName": true,
+      "artifactName": "GemmaSearch-${version}-x86_64.${ext}",
+      "target": [
+        { "target": "AppImage", "arch": ["x64"] },
+        { "target": "deb", "arch": ["x64"] }
+      ],
+      "category": "Utility"
+    },
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "portable", "arch": ["x64"] }
+      ]
+    },
+    "mac": {
+      "identity": null,
+      "target": [
+        { "target": "zip", "arch": ["x64", "arm64"] }
+      ]
+    },
+    "nsis": {
+      "artifactName": "GemmaSearch-Setup-${version}-${arch}.${ext}"
+    },
+    "portable": {
+      "artifactName": "GemmaSearch-${version}-${arch}-portable.${ext}"
+    },
+    "afterPack": "scripts/after-pack.cjs"
   }
 }

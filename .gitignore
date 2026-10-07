@@ -9,7 +9,11 @@ lerna-debug.log*
 
 node_modules
 dist
+dist-electron
+release
 dist-ssr
+/build/*
+!/build/icon.png
 /public/ort/
 *.local
 
