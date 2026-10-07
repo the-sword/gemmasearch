@@ -1,5 +1,5 @@
-import type { Modality, SearchItem } from '../host/types'
-import type { Settings } from '../settings'
+import type { Modality, SearchItem, VideoMode } from '../host/types'
+import type { DtypeProfile, Settings } from '../settings'
 
 export type ImageInput = { data: Uint8ClampedArray; width: number; height: number }
 
@@ -25,6 +25,7 @@ export interface PersistMeta {
 
 export interface SearchOptions {
   query: EmbedInput | { itemId: number }
+  queryVector?: Float32Array
   modalities?: Modality[]
   libIds?: string[]
   minScore?: number
@@ -41,7 +42,7 @@ export interface SearchHit {
 
 export type WorkerRequest =
   | { id: number; type: 'cancel'; targetId: number }
-  | { id: number; type: 'init'; settings: Settings }
+  | { id: number; type: 'init'; settings: Settings; splitAudioWasm?: boolean }
   | { id: number; type: 'embed'; input: EmbedInput; persist?: PersistMeta[] }
   | { id: number; type: 'search'; options: SearchOptions }
   | { id: number; type: 'remove-file'; fileKey: string }
@@ -59,13 +60,14 @@ export interface EngineStatus {
   shaderF16: boolean
   fallbackReason?: string
   loadMs: number
-  actualDtype: Settings['dtype']
+  actualDtype: DtypeProfile
 }
 
 export interface EmbeddedResult {
   vectors: Float32Array[]
   elapsedMs: number
   persistedIds?: number[]
+  videoMode?: VideoMode
 }
 
 export interface SearchResult {

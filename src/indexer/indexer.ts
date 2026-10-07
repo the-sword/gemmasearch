@@ -84,7 +84,7 @@ export class Indexer {
   async scan(library: Library): Promise<void> {
     this.stopped = false
     const entries: FileEntry[] = []
-    for await (const entry of host.listFiles(library)) entries.push(entry)
+    for await (const entry of await host.listFiles(library)) entries.push(entry)
     const seen = new Set(entries.map((entry) => fileKey(library, entry)))
     const existing = await getFiles(library.id)
     for (const file of existing) {
@@ -127,7 +127,10 @@ export class Indexer {
           record.reason = '该模态未启用'
         } else {
           this.emit({ done, total: updates.length, file: entry.path, status: '正在解码' })
-          const decoded = await decodeMedia(await host.readFile(library, entry), entry.name, this.settings)
+          const source = modality === 'video'
+            ? await host.mediaUrl(library, entry)
+            : await host.readFile(library, entry)
+          const decoded = await decodeMedia(source, entry.name, this.settings)
           record.duration = decoded.duration
           record.width = decoded.width
           record.height = decoded.height

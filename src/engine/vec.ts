@@ -15,6 +15,18 @@ export function truncateNormalize(vector: ArrayLike<number>, dimensions: number)
   return result
 }
 
+export function meanNormalize(vectors: ArrayLike<number>[], dimensions: number): Float32Array {
+  if (vectors.length === 0) throw new RangeError('at least one vector is required')
+  const mean = new Float32Array(dimensions)
+  for (const vector of vectors) {
+    for (let index = 0; index < Math.min(dimensions, vector.length); index += 1) {
+      mean[index] += vector[index] ?? 0
+    }
+  }
+  for (let index = 0; index < mean.length; index += 1) mean[index] /= vectors.length
+  return truncateNormalize(mean, dimensions)
+}
+
 export function float32ToFloat16(values: ArrayLike<number>): Uint16Array {
   const output = new Uint16Array(values.length)
   const buffer = new ArrayBuffer(4)

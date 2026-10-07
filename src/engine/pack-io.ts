@@ -1,5 +1,5 @@
 import type { FileRecord, Library, SearchItem, ThumbnailRecord } from '../host/types'
-import { modelSignature, type Settings } from '../settings'
+import { modelSignature, type DtypeProfile, type EffectiveBackend, type Settings } from '../settings'
 import { getDatabase, getFiles, getItems, getThumb, listLibraries, saveFile, saveLibrary } from './store'
 import { decodeIndexPack, encodeIndexPack, type PackPayload } from './pack'
 import { float32ToFloat16 } from './vec'
@@ -59,7 +59,12 @@ export async function exportLibraryPack(library: Library): Promise<Blob> {
   return new Blob([arrayBuffer(encodeIndexPack(payload, items.map((item) => item.vec)))], { type: 'application/octet-stream' })
 }
 
-export async function importLibraryPack(file: Blob, settings: Settings): Promise<{ library: Library; mismatch: boolean }> {
+export async function importLibraryPack(
+  file: Blob,
+  settings: Settings,
+  backend?: EffectiveBackend,
+  effectiveDtype?: DtypeProfile,
+): Promise<{ library: Library; mismatch: boolean }> {
   const bytes = new Uint8Array(await file.arrayBuffer())
   const { payload, vectors } = decodeIndexPack(bytes)
   const id = crypto.randomUUID()
@@ -105,7 +110,7 @@ export async function importLibraryPack(file: Blob, settings: Settings): Promise
     await tx.objectStore('thumbs').put(record)
   }
   await tx.done
-  return { library, mismatch: library.modelSig !== modelSignature(settings) }
+  return { library, mismatch: library.modelSig !== modelSignature(settings, backend, effectiveDtype) }
 }
 
 export async function listImportedLibraries(): Promise<Library[]> {

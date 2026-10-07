@@ -72,9 +72,13 @@ async function imageData(blob: Blob, maxSide = 512): Promise<{ data: Uint8Clampe
   return { data, width, height, thumb: await canvasBlob(thumbCanvas) }
 }
 
-async function decodeVideo(blob: Blob, settings: Settings): Promise<DecodedFile> {
-  const url = URL.createObjectURL(blob)
+type MediaSource = Blob | string
+
+async function decodeVideo(source: MediaSource, settings: Settings): Promise<DecodedFile> {
+  const url = typeof source === 'string' ? source : URL.createObjectURL(source)
+  const ownsUrl = typeof source !== 'string' || source.startsWith('blob:')
   const video = document.createElement('video')
+  video.crossOrigin = 'anonymous'
   video.src = url
   video.muted = true
   video.preload = 'auto'
@@ -127,7 +131,7 @@ async function decodeVideo(blob: Blob, settings: Settings): Promise<DecodedFile>
   } finally {
     video.removeAttribute('src')
     video.load()
-    URL.revokeObjectURL(url)
+    if (ownsUrl) URL.revokeObjectURL(url)
   }
 }
 
@@ -199,10 +203,12 @@ async function decodePdf(blob: Blob): Promise<DecodedFile> {
   return { chunks, thumb: firstThumb, pagesThumbs, pages: pdfDocument.numPages }
 }
 
-export async function decodeMedia(blob: Blob, filename: string, settings: Settings): Promise<DecodedFile> {
+export async function decodeMedia(source: MediaSource, filename: string, settings: Settings): Promise<DecodedFile> {
   const ext = filename.split('.').at(-1)?.toLowerCase() || ''
+  if (VIDEO_EXTENSIONS.has(ext)) return decodeVideo(source, settings)
+  if (typeof source === 'string') throw new Error('该文件类型需要读取文件内容')
   if (IMAGE_EXTENSIONS.has(ext)) {
-    const image = await imageData(blob)
+    const image = await imageData(source)
     return {
       chunks: [{ modality: 'image', input: { kind: 'image', data: image.data, width: image.width, height: image.height } }],
       thumb: image.thumb,
@@ -210,12 +216,11 @@ export async function decodeMedia(blob: Blob, filename: string, settings: Settin
       height: image.height,
     }
   }
-  if (VIDEO_EXTENSIONS.has(ext)) return decodeVideo(blob, settings)
-  if (AUDIO_EXTENSIONS.has(ext)) return decodeAudio(blob, settings)
-  if (ext === 'pdf') return decodePdf(blob)
+  if (AUDIO_EXTENSIONS.has(ext)) return decodeAudio(source, settings)
+  if (ext === 'pdf') return decodePdf(source)
   if (TEXT_EXTENSIONS.has(ext)) {
-    if (blob.size > 5 * 1024 * 1024) throw new Error('文本文件超过 5 MB')
-    const content = await blob.text()
+    if (source.size > 5 * 1024 * 1024) throw new Error('文本文件超过 5 MB')
+    const content = await source.text()
     const chunks: DecodedChunk[] = []
     const size = 1200
     const overlap = 200

@@ -2,20 +2,22 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, ty
 import { EngineClient } from './engine/client'
 import type { EngineStatus, EmbedInput, SearchHit, SearchResult } from './engine/protocol'
 import { exportLibraryPack, importLibraryPack } from './engine/pack-io'
-import { getFiles, getItems, getThumb, listLibraries, readSetting, removeLibrary, saveLibrary, saveSetting } from './engine/store'
+import { getFile, getFiles, getItems, getThumb, listLibraries, readSetting, removeLibrary, saveLibrary, saveSetting } from './engine/store'
 import { host } from './host'
 import type { FileRecord, Library, Modality, SearchItem, ThumbnailRecord } from './host/types'
 import { createFilesLibrary, forgetSessionLibrary, hasSessionLibrary } from './host/web'
 import { Indexer, type IndexProgress } from './indexer/indexer'
 import { translate } from './i18n'
 import { decodeAudio, decodeMedia } from './media/decode'
-import { DEFAULT_SETTINGS, modelSignature, type Settings } from './settings'
+import { DEFAULT_SETTINGS, modelSignature, normalizeSettings, type Dtype, type EffectiveBackend, type Settings } from './settings'
 import { Icon } from './ui/Icons'
 import './App.css'
 
 type Page = 'search' | 'detail' | 'libraries' | 'settings' | 'onboarding'
 type EnrichedHit = SearchHit & { file?: FileRecord; thumb?: ThumbnailRecord }
 const MODALITIES: Modality[] = ['image', 'video', 'audio', 'pdf', 'text']
+const DTYPE_FIELDS = ['model', 'vision_encoder', 'audio_encoder'] as const
+const DTYPE_LABELS = { model: '文本模型', vision_encoder: '视觉编码器', audio_encoder: '音频编码器' } as const
 
 function fileExtension(path: string): string {
   return path.split('.').at(-1)?.toUpperCase() || 'FILE'
@@ -52,10 +54,17 @@ function App() {
   const imageInput = useRef<HTMLInputElement>(null)
   const packInput = useRef<HTMLInputElement>(null)
   const engineRef = useRef<EngineClient | null>(null)
+  const engineStatusRef = useRef<EngineStatus | null>(null)
   const indexers = useRef(new Map<string, Indexer>())
+  const watchers = useRef(new Map<string, () => void>())
+  const watchTimers = useRef(new Map<string, number>())
+  const queuedRescans = useRef(new Set<string>())
   const loadedSettings = useRef('')
   const recorder = useRef<MediaRecorder | null>(null)
   const t = (key: Parameters<typeof translate>[1]) => translate(settings, key)
+  const activeBackend: EffectiveBackend = engineStatus?.backend ?? (settings.backend === 'wasm' ? 'wasm' : 'webgpu')
+  const activeDtype = engineStatus?.actualDtype ?? settings.dtype[activeBackend]
+  const activeModelSignature = modelSignature(settings, activeBackend, activeDtype)
 
   useEffect(() => {
     if (!queryImage) {
@@ -79,7 +88,7 @@ function App() {
       readSetting<boolean>('onboardingComplete'),
       refreshData(),
     ]).then(([savedSettings, onboardingComplete]) => {
-      if (savedSettings) setSettings({ ...DEFAULT_SETTINGS, ...savedSettings })
+      if (savedSettings) setSettings(normalizeSettings(savedSettings))
       if (onboardingComplete) setPage('search')
     })
   }, [refreshData])
@@ -99,6 +108,7 @@ function App() {
       setLoadProgress({ percent: 0, file: '' })
       try {
         const status = await client.init(settings, (percent, file) => setLoadProgress({ percent, file: file || '' }))
+        engineStatusRef.current = status
         setEngineStatus(status)
         loadedSettings.current = signature
       } finally {
@@ -110,18 +120,32 @@ function App() {
 
   const updateSettings = (patch: Partial<Settings>) => {
     const nextSettings = { ...settings, ...patch }
+    engineStatusRef.current = null
+    setEngineStatus(null)
+    loadedSettings.current = ''
     setSettings(nextSettings)
     void saveSetting('settings', nextSettings)
   }
 
+  const updateDtype = (backend: EffectiveBackend, key: typeof DTYPE_FIELDS[number], value: Dtype) => {
+    const dtype = backend === 'webgpu'
+      ? { ...settings.dtype, webgpu: { ...settings.dtype.webgpu, [key]: value } }
+      : { ...settings.dtype, wasm: { ...settings.dtype.wasm, [key]: value } }
+    updateSettings({ dtype })
+  }
+
   const startIndexing = useCallback(async (library: Library) => {
-    if (indexers.current.has(library.id)) return
+    if (indexers.current.has(library.id)) {
+      queuedRescans.current.add(library.id)
+      return
+    }
     try {
       const engine = await ensureEngine()
-      if (library.modelSig !== modelSignature(settings)) {
+      const signature = modelSignature(settings, engineStatusRef.current?.backend, engineStatusRef.current?.actualDtype)
+      if (library.modelSig !== signature) {
         for (const file of await getFiles(library.id)) await engine.removeFile(`${library.id}:${file.path}`)
       }
-      const updatedLibrary = { ...library, modelSig: modelSignature(settings) }
+      const updatedLibrary = { ...library, modelSig: signature }
       await saveLibrary(updatedLibrary)
       const indexer = new Indexer(engine, settings)
       indexers.current.set(library.id, indexer)
@@ -130,6 +154,9 @@ function App() {
         await indexer.scan(updatedLibrary)
       } finally {
         indexers.current.delete(library.id)
+        if (queuedRescans.current.delete(library.id)) {
+          window.setTimeout(() => void startIndexing(updatedLibrary), 0)
+        }
       }
       await refreshData()
       setToast('索引已更新')
@@ -154,7 +181,7 @@ function App() {
       const library: Library = {
         id: crypto.randomUUID(),
         name: source.name,
-        kind: source.handle ? 'folder' : 'files',
+        kind: host.kind === 'electron' || source.handle ? 'folder' : 'files',
         rootPath: source.rootPath,
         handle: source.handle,
         modelSig: modelSignature(settings),
@@ -169,6 +196,40 @@ function App() {
     }
   }
 
+  useEffect(() => {
+    const folderLibraries = libraries.filter((library) => library.kind === 'folder' && library.rootPath)
+    let disposed = false
+    void (async () => {
+      try {
+        await host.registerRoots?.(folderLibraries.map((library) => library.rootPath!))
+      } catch (error) {
+        if (!disposed) setToast(error instanceof Error ? error.message : '无法注册文件夹')
+        return
+      }
+      if (disposed || !host.watch) return
+      for (const library of folderLibraries) {
+        if (disposed) break
+        const stop = host.watch(library, () => {
+          const previousTimer = watchTimers.current.get(library.id)
+          if (previousTimer !== undefined) window.clearTimeout(previousTimer)
+          const timer = window.setTimeout(() => {
+            watchTimers.current.delete(library.id)
+            void startIndexing(library)
+          }, 350)
+          watchTimers.current.set(library.id, timer)
+        })
+        watchers.current.set(library.id, stop)
+      }
+    })()
+    return () => {
+      disposed = true
+      for (const stop of watchers.current.values()) stop()
+      watchers.current.clear()
+      for (const timer of watchTimers.current.values()) window.clearTimeout(timer)
+      watchTimers.current.clear()
+    }
+  }, [libraries, startIndexing])
+
   const runSearch = async (event?: FormEvent, similarItemId?: number) => {
     event?.preventDefault()
     if (!query.trim() && !queryImage && similarItemId === undefined) {
@@ -177,6 +238,10 @@ function App() {
     }
     try {
       const engine = await ensureEngine()
+      const signature = modelSignature(settings, engineStatusRef.current?.backend, engineStatusRef.current?.actualDtype)
+      const compatibleLibraries = libraries
+        .filter((library) => library.modelSig === signature)
+        .filter((library) => !selectedLibraries.length || selectedLibraries.includes(library.id))
       let searchQuery: EmbedInput | { itemId: number }
       if (similarItemId !== undefined) {
         searchQuery = { itemId: similarItemId }
@@ -193,18 +258,15 @@ function App() {
       const result = await engine.search({
         query: searchQuery,
         modalities: selectedModalities.length ? selectedModalities : undefined,
-        libIds: selectedLibraries.length ? selectedLibraries : undefined,
+        libIds: compatibleLibraries.map((library) => library.id),
         minScore: threshold,
         limit: 60,
       })
       setResults(result)
       setPage('search')
       const enriched = await Promise.all(result.hits.map(async (hit) => {
-        const [{ getFile }, thumb] = await Promise.all([
-          import('./engine/store'),
-          getThumb(hit.fileKey),
-        ])
-        return { ...hit, file: await getFile(hit.fileKey), thumb }
+        const [file, thumb] = await Promise.all([getFile(hit.fileKey), getThumb(hit.fileKey)])
+        return { ...hit, file, thumb }
       }))
       setEnrichedHits(enriched)
     } catch (error) {
@@ -232,6 +294,10 @@ function App() {
     if (page === 'search' && dropped.length === 1 && dropped[0]!.type.startsWith('image/')) {
       setQueryImage(dropped[0]!)
     } else {
+      if (host.kind === 'electron') {
+        setToast('Electron 版本请添加文件夹')
+        return
+      }
       void addFiles(dropped)
     }
   }
@@ -259,8 +325,8 @@ function App() {
             const result = await engine.search({ query: chunk.input })
             setResults(result)
             setEnrichedHits(await Promise.all(result.hits.map(async (hit) => {
-              const [{ getFile }, thumb] = await Promise.all([import('./engine/store'), getThumb(hit.fileKey)])
-              return { ...hit, file: await getFile(hit.fileKey), thumb }
+              const [file, thumb] = await Promise.all([getFile(hit.fileKey), getThumb(hit.fileKey)])
+              return { ...hit, file, thumb }
             })))
             setPage('search')
           }
@@ -283,7 +349,12 @@ function App() {
     const file = event.target.files?.[0]
     if (!file) return
     try {
-      const { library, mismatch } = await importLibraryPack(file, settings)
+      const { library, mismatch } = await importLibraryPack(
+        file,
+        settings,
+        engineStatusRef.current?.backend,
+        engineStatusRef.current?.actualDtype,
+      )
       await engineRef.current?.refresh()
       await refreshData()
       setToast(mismatch ? `${library.name}：${t('rebuild')}` : `已导入 ${library.name}`)
@@ -362,7 +433,7 @@ function App() {
           ))}
         </section>
         <div className="sidebar-actions">
-          <button className="button secondary full" onClick={() => fileInput.current?.click()}><span>＋</span>{t('addFiles')}</button>
+          {host.kind === 'web' && <button className="button secondary full" onClick={() => fileInput.current?.click()}><span>＋</span>{t('addFiles')}</button>}
           <button className="button text full" onClick={() => void addFolder()}><Icon name="folder" size={16} />{t('addFolder')}</button>
           <input ref={fileInput} hidden type="file" multiple onChange={(event) => { const selected = Array.from(event.target.files || []); event.currentTarget.value = ''; void addFiles(selected) }} />
         </div>
@@ -398,7 +469,7 @@ function App() {
                   setToast('模型已就绪，可添加文件')
                 }).catch((error: unknown) => setToast(error instanceof Error ? error.message : '模型加载失败'))
               }}>{busy ? `${t('modelDownload')} ${loadProgress.percent}%` : '加载模型并开始'}<span>→</span></button>
-              <div className="welcome-details"><span className={`gpu-pill ${navigator.gpu ? 'available' : ''}`}>◈ {navigator.gpu ? 'WebGPU 可用' : '将使用 WASM CPU'}</span><span>模型 q4 · 默认 256 维</span></div>
+              <div className="welcome-details"><span className={`gpu-pill ${navigator.gpu ? 'available' : ''}`}>◈ {navigator.gpu ? 'WebGPU 可用' : '将使用 WASM CPU'}</span><span>WebGPU q4 · WASM fp16 · 默认 256 维</span></div>
               {busy && <div className="load-track"><i style={{ width: `${loadProgress.percent}%` }} /></div>}
               {loadProgress.file && <small className="load-file">{loadProgress.file}</small>}
             </div>
@@ -408,7 +479,7 @@ function App() {
 
         {page === 'search' && (
           <section className="page-content search-page">
-            {libraries.some((library) => library.modelSig !== modelSignature(settings)) && <div className="rebuild-banner"><span>ⓘ</span><div><b>{t('rebuild')}</b><small>当前模型设置与部分索引库不同，需重新扫描后才能参与搜索。</small></div><button className="button secondary small" onClick={() => setPage('libraries')}>查看索引库</button></div>}
+            {libraries.some((library) => library.modelSig !== activeModelSignature) && <div className="rebuild-banner"><span>ⓘ</span><div><b>{t('rebuild')}</b><small>当前模型设置与部分索引库不同，需重新扫描后才能参与搜索。</small></div><button className="button secondary small" onClick={() => setPage('libraries')}>查看索引库</button></div>}
             <div className="page-heading"><div><p className="eyebrow">本地语义搜索</p><h1>{t('searchTitle')}</h1><p className="subtitle">{t('searchHint')}</p></div>{libraries.length > 0 && <div className="indexed-summary"><b>{files.filter((file) => file.status === 'ok').length}</b><span>个文件已索引</span></div>}</div>
             <form className="search-composer" onSubmit={(event) => void runSearch(event)}>
               <Icon name="search" size={20} />
@@ -431,7 +502,7 @@ function App() {
               </div>
             </div>
             {results && <div className="results-summary"><span>找到 <b>{results.hits.length}</b> 个结果</span><span>·</span><span>{results.totalVectors.toLocaleString()} 条向量</span><span>·</span><span>{results.elapsedMs.toFixed(0)} ms</span></div>}
-            {enrichedHits.length ? <div className={listMode ? 'result-list' : 'result-grid'}>{enrichedHits.map((hit) => <ResultCard key={hit.fileKey} hit={hit} listMode={listMode} onOpen={() => void openDetail(hit)} />)}</div> : <div className="search-empty"><div className="empty-illustration"><div className="empty-circle"><Icon name="image" size={36} /></div><span className="spark spark-one">✦</span><span className="spark spark-two">✧</span><span className="empty-dash" /></div><h2>{results ? '没有匹配结果' : t('noResults')}</h2><p>{libraries.length ? '尝试更换关键词、筛选条件或降低相似度阈值。' : '先添加文件，Gemma 会在本地建立可搜索的语义索引。'}</p>{!libraries.length && <button className="button secondary" onClick={() => fileInput.current?.click()}>＋ 添加一些文件</button>}</div>}
+            {enrichedHits.length ? <div className={listMode ? 'result-list' : 'result-grid'}>{enrichedHits.map((hit) => <ResultCard key={hit.fileKey} hit={hit} listMode={listMode} onOpen={() => void openDetail(hit)} />)}</div> : <div className="search-empty"><div className="empty-illustration"><div className="empty-circle"><Icon name="image" size={36} /></div><span className="spark spark-one">✦</span><span className="spark spark-two">✧</span><span className="empty-dash" /></div><h2>{results ? '没有匹配结果' : t('noResults')}</h2><p>{libraries.length ? '尝试更换关键词、筛选条件或降低相似度阈值。' : '先添加文件，Gemma 会在本地建立可搜索的语义索引。'}</p>{!libraries.length && <button className="button secondary" onClick={() => host.kind === 'electron' ? void addFolder() : fileInput.current?.click()}>＋ {host.kind === 'electron' ? '添加文件夹' : '添加一些文件'}</button>}</div>}
           </section>
         )}
 
@@ -454,14 +525,14 @@ function App() {
 
         {page === 'libraries' && (
           <section className="page-content management-page">
-            <div className="page-heading compact"><div><p className="eyebrow">LIBRARY</p><h1>{t('libraries')}</h1><p className="subtitle">管理本地索引、扫描进度和跳过的文件。</p></div><div className="management-buttons"><button className="button secondary" onClick={() => packInput.current?.click()}>{t('import')}</button><button className="button primary" onClick={() => fileInput.current?.click()}>＋ {t('addFiles')}</button><input ref={packInput} hidden type="file" accept=".gsidx,application/octet-stream" onChange={(event) => void importPack(event)} /></div></div>
+            <div className="page-heading compact"><div><p className="eyebrow">LIBRARY</p><h1>{t('libraries')}</h1><p className="subtitle">管理本地索引、扫描进度和跳过的文件。</p></div><div className="management-buttons"><button className="button secondary" onClick={() => packInput.current?.click()}>{t('import')}</button>{host.kind === 'web' && <button className="button primary" onClick={() => fileInput.current?.click()}>＋ {t('addFiles')}</button>}<button className="button primary" onClick={() => void addFolder()}>＋ {t('addFolder')}</button><input ref={packInput} hidden type="file" accept=".gsidx,application/octet-stream" onChange={(event) => void importPack(event)} /></div></div>
             <div className="library-table-wrap"><table className="library-table"><thead><tr><th>资料库</th><th>类型</th><th>文件</th><th>索引进度</th><th>状态</th><th>操作</th></tr></thead><tbody>
               {libraries.map((library) => {
                 const libraryFiles = files.filter((file) => file.libId === library.id)
                 const progressValue = progress[library.id]
                 const doneCount = progressValue?.done ?? libraryFiles.length
                 const totalCount = progressValue?.total ?? libraryFiles.length
-                const mismatch = library.modelSig !== modelSignature(settings)
+                const mismatch = library.modelSig !== activeModelSignature
                 const canRescan = library.kind !== 'imported' && (library.kind !== 'files' || hasSessionLibrary(library))
                 return <tr key={library.id}><td><div className="library-name"><span className="library-icon"><Icon name="folder" size={17} /></span><div><b>{library.name}</b><small>{library.rootPath?.startsWith('session:') ? (hasSessionLibrary(library) ? '临时会话文件' : '原文件需重新添加') : library.rootPath || '导入的索引'}</small></div></div></td><td><span className="type-badge">{library.kind === 'folder' ? '文件夹' : library.kind === 'imported' ? '导入' : '文件'}</span></td><td>{libraryFiles.length}</td><td><div className="progress-cell"><div className="progress-track"><i style={{ width: `${totalCount ? Math.round(doneCount / totalCount * 100) : libraryFiles.length ? 100 : 0}%` }} /></div><span>{progressValue ? `${doneCount}/${totalCount}` : `${libraryFiles.filter((file) => file.status === 'ok').length} 已索引`}</span></div>{progressValue?.file && <small className="current-task">{progressValue.file}</small>}</td><td><span className={`state-badge ${mismatch ? 'warning' : progressValue ? 'working' : 'ready'}`}>{mismatch ? t('rebuild') : progressValue?.status || '就绪'}</span></td><td><div className="table-actions"><button title={progressValue?.status === '已暂停' ? t('resume') : t('pause')} disabled={!indexers.current.has(library.id)} onClick={() => progressValue?.status === '已暂停' ? indexers.current.get(library.id)?.resume() : indexers.current.get(library.id)?.pause()}>{progressValue?.status === '已暂停' ? '▶' : 'Ⅱ'}</button><button title={canRescan ? t('rescan') : '原文件需重新添加后才能扫描'} disabled={!canRescan} onClick={() => void startIndexing(library)}>↻</button><button title={t('export')} onClick={() => void beginExport(library)}>⇩</button><button title={t('remove')} onClick={() => void remove(library)}>×</button></div></td></tr>
               })}
@@ -477,7 +548,29 @@ function App() {
             <div className="settings-columns"><div className="settings-main panel">
               <div className="setting-section"><h2>模型与推理</h2>
                 <SettingRow title="推理后端" hint="自动优先使用 WebGPU，不可用时回退到 WASM。"><select value={settings.backend} onChange={(event) => updateSettings({ backend: event.target.value as Settings['backend'] })}><option value="auto">自动（WebGPU → WASM）</option><option value="wasm">WASM CPU</option></select></SettingRow>
-                <SettingRow title="模型精度" hint="应用于所有后端，保证向量兼容。"><div className="dtype-grid">{(['model', 'vision_encoder', 'audio_encoder'] as const).map((key) => <label key={key}><small>{key === 'model' ? '文本模型' : key === 'vision_encoder' ? '视觉编码器' : '音频编码器'}</small><select value={settings.dtype[key]} onChange={(event) => updateSettings({ dtype: { ...settings.dtype, [key]: event.target.value as Settings['dtype'][typeof key] } })}><option value="q4">q4 · 最省资源</option><option value="q8">q8 · 平衡</option><option value="fp16">fp16 · 高精度</option></select></label>)}</div></SettingRow>
+                <SettingRow title="模型精度" hint="按推理后端分别配置；更改后需重建对应索引。">
+                  <div className="dtype-table">
+                    <div className="dtype-row dtype-heading"><span>后端</span>{DTYPE_FIELDS.map((key) => <span key={key}>{DTYPE_LABELS[key]}</span>)}</div>
+                    {(['webgpu', 'wasm'] as const).map((backend) => (
+                      <div className="dtype-row" key={backend}>
+                        <b>{backend === 'webgpu' ? 'WebGPU' : 'WASM'}</b>
+                        {DTYPE_FIELDS.map((key) => (
+                          <select
+                            key={key}
+                            aria-label={`${backend} ${DTYPE_LABELS[key]}`}
+                            value={settings.dtype[backend][key]}
+                            onChange={(event) => updateDtype(backend, key, event.target.value as Dtype)}
+                          >
+                            <option value="q4">q4</option>
+                            <option value="q8">q8</option>
+                            <option value="q4f16">q4f16</option>
+                            <option value="fp16">fp16</option>
+                          </select>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                </SettingRow>
                 <SettingRow title="向量维度" hint="维度越低，占用空间越小。更改后需重建索引。"><div className="segmented">{([768, 512, 256, 128] as const).map((dim) => <button key={dim} className={settings.dim === dim ? 'active' : ''} onClick={() => updateSettings({ dim })}>{dim}</button>)}</div></SettingRow>
                 <SettingRow title="视觉 Token 预算" hint="更高预算可保留更多图片细节，但推理更慢。"><select value={settings.visionTokens} onChange={(event) => updateSettings({ visionTokens: Number(event.target.value) as Settings['visionTokens'] })}>{[70, 140, 280, 560, 1120].map((value) => <option key={value} value={value}>{value} tokens</option>)}</select></SettingRow>
                 <SettingRow title="启用模态" hint="关闭未使用的编码器以减少下载和内存。"><div className="toggle-row"><label><input type="checkbox" checked={settings.modalities.vision} onChange={(event) => updateSettings({ modalities: { ...settings.modalities, vision: event.target.checked } })} />图片与视频</label><label><input type="checkbox" checked={settings.modalities.audio} onChange={(event) => updateSettings({ modalities: { ...settings.modalities, audio: event.target.checked } })} />音频</label></div></SettingRow>
@@ -485,7 +578,7 @@ function App() {
               <div className="setting-section"><h2>索引性能</h2><SettingRow title="视频片段" hint="视频按时间段抽帧并分别编码。"><select value={settings.videoSegmentSec} onChange={(event) => updateSettings({ videoSegmentSec: Number(event.target.value) as Settings['videoSegmentSec'] })}><option value={8}>8 秒</option><option value={16}>16 秒</option></select></SettingRow><SettingRow title="音频片段" hint="长音频拆分为连续片段。"><select value={settings.audioSegmentSec} onChange={(event) => updateSettings({ audioSegmentSec: Number(event.target.value) as Settings['audioSegmentSec'] })}><option value={30}>30 秒</option><option value={60}>60 秒</option></select></SettingRow><SettingRow title="索引速度" hint="低速会在批次间增加间隔。"><select value={settings.indexSpeed} onChange={(event) => updateSettings({ indexSpeed: event.target.value as Settings['indexSpeed'] })}><option value="low">低 · 200 ms</option><option value="mid">中 · 50 ms</option><option value="high">高 · 无间隔</option></select></SettingRow></div>
               <div className="setting-section"><h2>界面与网络</h2><SettingRow title="模型来源" hint="可切换 Hugging Face 镜像站点。"><select value={settings.modelHost} onChange={(event) => updateSettings({ modelHost: event.target.value as Settings['modelHost'] })}><option value="hf">Hugging Face</option><option value="mirror">HF Mirror</option></select></SettingRow><SettingRow title={t('language')}><select value={settings.lang} onChange={(event) => updateSettings({ lang: event.target.value as Settings['lang'] })}><option value="zh">简体中文</option><option value="en">English</option></select></SettingRow></div>
             </div><aside className="settings-aside">
-              <div className="panel backend-panel"><div className="panel-header"><h3>运行状态</h3><span className={`state-badge ${engineStatus ? 'ready' : ''}`}>{engineStatus?.backend || '未加载'}</span></div><dl><dt>设备</dt><dd>{engineStatus?.adapter || (engineStatus?.backend === 'wasm' ? 'CPU' : '—')}</dd><dt>模型精度</dt><dd>{engineStatus?.actualDtype.model || settings.dtype.model}</dd><dt>模型加载</dt><dd>{engineStatus ? `${(engineStatus.loadMs / 1000).toFixed(1)} 秒` : '待启动'}</dd></dl>{engineStatus?.fallbackReason && <p className="fallback-note">{engineStatus.fallbackReason}</p>}</div>
+              <div className="panel backend-panel"><div className="panel-header"><h3>运行状态</h3><span className={`state-badge ${engineStatus ? 'ready' : ''}`}>{engineStatus?.backend || '未加载'}</span></div><dl><dt>设备</dt><dd>{engineStatus?.adapter || (engineStatus?.backend === 'wasm' ? 'CPU' : '—')}</dd><dt>模型精度</dt><dd>{activeDtype.model}</dd><dt>模型加载</dt><dd>{engineStatus ? `${(engineStatus.loadMs / 1000).toFixed(1)} 秒` : '待启动'}</dd></dl>{engineStatus?.fallbackReason && <p className="fallback-note">{engineStatus.fallbackReason}</p>}</div>
               <div className="panel cache-panel"><span className="cache-icon">⌁</span><h3>模型缓存</h3><p>已下载的模型会保存在此浏览器中，清理后下次使用需要重新下载。</p><button className="button secondary full" onClick={async () => { await caches.delete('transformers-cache'); setToast('模型缓存已清理') }}>清理模型缓存</button></div>
               <div className="privacy-card"><b>隐私设计</b><p>文本、媒体和索引向量均在浏览器中处理。联网仅用于首次获取模型文件。</p></div>
             </aside></div>
@@ -534,7 +627,7 @@ function VideoDetail({ library, file, hit }: { library: Library; file: FileRecor
   useEffect(() => {
     let current = ''
     void host.mediaUrl(library, file).then((mediaUrl) => { current = mediaUrl; setUrl(mediaUrl) }).catch(() => setUrl(''))
-    return () => { if (current) URL.revokeObjectURL(current) }
+    return () => { if (current.startsWith('blob:')) URL.revokeObjectURL(current) }
   }, [file.path, library.id])
   useEffect(() => {
     if (videoRef.current && url && videoRef.current.readyState >= 1) {
@@ -555,7 +648,7 @@ function AudioDetail({ library, file, hit }: { library: Library; file: FileRecor
       setUrl(mediaUrl)
       setPeaks(thumb?.peaks || [])
     }).catch(() => setUrl(''))
-    return () => { if (current) URL.revokeObjectURL(current) }
+    return () => { if (current.startsWith('blob:')) URL.revokeObjectURL(current) }
   }, [file.path, library.id])
   const seekToHit = () => {
     if (audioRef.current && audioRef.current.readyState >= 1) {

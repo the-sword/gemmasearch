@@ -9,10 +9,10 @@ import {
   env,
 } from '@huggingface/transformers'
 import type { Processor, PreTrainedModel } from '@huggingface/transformers'
-import type { SearchItem, Modality } from '../host/types'
-import type { Settings } from '../settings'
-import { float16ToFloat32, float32ToFloat16, topK, truncateNormalize, calibrateAudioScore } from './vec'
-import { getItems, listLibraries, removeFileRecords, removeLibrary } from './store'
+import type { SearchItem, Modality, VideoMode } from '../host/types'
+import { modelSignature, type DtypeProfile, type EffectiveBackend, type Settings } from '../settings'
+import { float16ToFloat32, float32ToFloat16, meanNormalize, topK, truncateNormalize, calibrateAudioScore } from './vec'
+import { getItems, listLibraries, removeFileRecords, removeLibrary, saveItem } from './store'
 import type { EmbedInput, EngineStatus, ImageInput, PersistMeta, SearchHit, SearchOptions, WorkerRequest, WorkerResponse } from './protocol'
 
 const MODEL_ID = 'onnx-community/embeddinggemma-2-ONNX'
@@ -20,11 +20,13 @@ const workerScope = self as DedicatedWorkerGlobalScope
 let processor: Processor | undefined
 let model: PreTrainedModel | undefined
 let currentSettings: Settings | undefined
+let currentModelSignature: string | undefined
 let backend: 'webgpu' | 'wasm' = 'wasm'
 let vectorItems: Array<SearchItem & { id: number }> | undefined
 let vectorMatrix: Float32Array | undefined
 const activeRequests = new Set<number>()
 const cancelledRequests = new Set<number>()
+let videoTokenBudgetLogged = false
 
 function disposeModel(): void {
   (model as unknown as { dispose?: () => void } | undefined)?.dispose?.()
@@ -75,11 +77,25 @@ function makeInput(input: EmbedInput): [unknown, unknown?, unknown?, unknown?] {
   }
 }
 
-async function getVectors(input: EmbedInput): Promise<Float32Array[]> {
+async function runModelVectors(input: EmbedInput, id: number): Promise<Float32Array[]> {
+  checkCancelled(id)
   if (!currentSettings || !processor || !model) throw new Error('引擎尚未初始化')
   const args = makeInput(input)
   const prepared = await (processor as (...values: unknown[]) => Promise<unknown>)(...args)
+  checkCancelled(id)
+  if (input.kind === 'video' && !videoTokenBudgetLogged) {
+    const videoFeatures = prepared as { num_soft_tokens_per_video?: number[]; num_frames_per_video?: number[] }
+    const tokensPerFrame = videoFeatures.num_soft_tokens_per_video?.[0]
+    const frameCount = videoFeatures.num_frames_per_video?.[0] ?? input.frames.length
+    console.info('[GemmaSearch] video soft-token budget', {
+      tokensPerFrame,
+      frameCount,
+      totalTokens: tokensPerFrame === undefined ? undefined : tokensPerFrame * frameCount,
+    })
+    videoTokenBudgetLogged = true
+  }
   const output = await (model as (input: unknown) => Promise<{ sentence_embedding?: { data: ArrayLike<number>; dims?: number[] } }>)(prepared)
+  checkCancelled(id)
   const embedding = output.sentence_embedding
   if (!embedding?.data) throw new Error('模型未返回 sentence_embedding')
   const dims = currentSettings.dim
@@ -92,10 +108,49 @@ async function getVectors(input: EmbedInput): Promise<Float32Array[]> {
   return vectors
 }
 
-async function loadBackend(settings: Settings, device: 'webgpu' | 'wasm', id: number, shaderF16: boolean): Promise<{ dtype: Settings['dtype']; loadMs: number }> {
+function isWasmBadAlloc(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return message.includes('std::bad_alloc')
+}
+
+async function getVectorsDetailed(
+  input: EmbedInput,
+  id: number,
+): Promise<{ vectors: Float32Array[]; videoMode?: VideoMode }> {
+  if (input.kind !== 'video') return { vectors: await runModelVectors(input, id) }
+  try {
+    return { vectors: await runModelVectors(input, id), videoMode: 'native' }
+  } catch (error) {
+    if (backend !== 'wasm' || !isWasmBadAlloc(error)) throw error
+    console.warn('[GemmaSearch] native video embedding hit std::bad_alloc; using frame-mean fallback')
+    const frameVectors: Float32Array[] = []
+    for (const frame of input.frames) {
+      checkCancelled(id)
+      const [vector] = await runModelVectors(
+        { kind: 'image', data: frame.data, width: frame.width, height: frame.height },
+        id,
+      )
+      if (vector) frameVectors.push(vector)
+    }
+    if (frameVectors.length === 0) throw new Error('视频不包含可嵌入帧', { cause: error })
+    return { vectors: [meanNormalize(frameVectors, currentSettings!.dim)], videoMode: 'frame-mean' }
+  }
+}
+
+async function getVectors(input: EmbedInput, id: number): Promise<Float32Array[]> {
+  return (await getVectorsDetailed(input, id)).vectors
+}
+
+async function loadBackend(
+  settings: Settings,
+  device: EffectiveBackend,
+  id: number,
+  shaderF16: boolean,
+  splitAudio = false,
+): Promise<{ dtype: DtypeProfile; loadMs: number }> {
   const started = performance.now()
-  const dtype = { ...settings.dtype }
-  if (device === 'webgpu' && settings.dtype.model === 'fp16' && !shaderF16) {
+  const dtype = { ...settings.dtype[device] }
+  if (device === 'webgpu' && dtype.model === 'fp16' && !shaderF16) {
     dtype.model = 'q4'
     dtype.vision_encoder = 'q4'
     dtype.audio_encoder = 'q4'
@@ -103,16 +158,12 @@ async function loadBackend(settings: Settings, device: 'webgpu' | 'wasm', id: nu
   const config = await AutoConfig.from_pretrained(MODEL_ID)
   const modalityConfig = config as typeof config & { vision_config?: unknown; audio_config?: unknown }
   if (!settings.modalities.vision) modalityConfig.vision_config = null
-  if (!settings.modalities.audio) modalityConfig.audio_config = null
+  if (!settings.modalities.audio || splitAudio) modalityConfig.audio_config = null
   processor = await AutoProcessor.from_pretrained(MODEL_ID)
   const processorConfig = processor as unknown as {
     image_processor?: { max_soft_tokens?: number }
-    video_processor?: { frame_processor?: { max_soft_tokens?: number } }
   }
   if (processorConfig.image_processor) processorConfig.image_processor.max_soft_tokens = settings.visionTokens
-  if (processorConfig.video_processor?.frame_processor) {
-    processorConfig.video_processor.frame_processor.max_soft_tokens = settings.visionTokens
-  }
   model = await AutoModel.from_pretrained(MODEL_ID, {
     device,
     dtype: { model: dtype.model, vision_encoder: dtype.vision_encoder, audio_encoder: dtype.audio_encoder },
@@ -127,11 +178,13 @@ async function loadBackend(settings: Settings, device: 'webgpu' | 'wasm', id: nu
   return { dtype, loadMs: performance.now() - started }
 }
 
-async function init(settings: Settings, id: number): Promise<EngineStatus> {
+async function init(settings: Settings, id: number, splitAudioWasm: boolean): Promise<EngineStatus> {
   checkCancelled(id)
   disposeModel()
   processor = undefined
   currentSettings = settings
+  currentModelSignature = undefined
+  videoTokenBudgetLogged = false
   vectorItems = undefined
   vectorMatrix = undefined
   env.remoteHost = settings.modelHost === 'mirror' ? 'https://hf-mirror.com/' : 'https://huggingface.co/'
@@ -153,10 +206,11 @@ async function init(settings: Settings, id: number): Promise<EngineStatus> {
         shaderF16 = adapter.features.has('shader-f16')
         const loaded = await loadBackend(settings, 'webgpu', id, shaderF16)
         checkCancelled(id)
-        const selfTest = await getVectors({ kind: 'text', text: 'a photograph', role: 'query' })
+        const selfTest = await getVectors({ kind: 'text', text: 'a photograph', role: 'query' }, id)
         checkCancelled(id)
         const norm = Math.sqrt(selfTest[0]?.reduce((sum, value) => sum + value * value, 0) || 0)
         if (!Number.isFinite(norm) || norm <= 0) throw new Error('WebGPU 自检向量无效')
+        currentModelSignature = modelSignature(settings, 'webgpu', loaded.dtype)
         return {
           backend: 'webgpu',
           adapter: adapterName,
@@ -175,13 +229,20 @@ async function init(settings: Settings, id: number): Promise<EngineStatus> {
   } else {
     fallbackReason = settings.backend === 'wasm' ? '已强制使用 WASM' : '浏览器未提供 WebGPU'
   }
-  const loaded = await loadBackend(settings, 'wasm', id, false)
+  const loaded = await loadBackend(
+    settings,
+    'wasm',
+    id,
+    false,
+    splitAudioWasm && settings.modalities.vision && settings.modalities.audio,
+  )
   checkCancelled(id)
-  const selfTest = await getVectors({ kind: 'text', text: 'a photograph', role: 'query' })
+  const selfTest = await getVectors({ kind: 'text', text: 'a photograph', role: 'query' }, id)
   checkCancelled(id)
   if (!selfTest[0]?.every(Number.isFinite) || Math.sqrt(selfTest[0]?.reduce((sum, value) => sum + value * value, 0) || 0) <= 0) {
     throw new Error('WASM 自检向量无效')
   }
+  currentModelSignature = modelSignature(settings, 'wasm', loaded.dtype)
   return {
     backend: 'wasm',
     adapter: adapterName,
@@ -210,9 +271,12 @@ async function embed(input: EmbedInput, persist: PersistMeta[] | undefined, id: 
     batchInputs.push(input)
   }
   const vectors: Float32Array[] = []
+  let videoMode: VideoMode | undefined
   for (const batch of batchInputs) {
     checkCancelled(id)
-    vectors.push(...await getVectors(batch))
+    const embedded = await getVectorsDetailed(batch, id)
+    vectors.push(...embedded.vectors)
+    videoMode = embedded.videoMode ?? videoMode
     checkCancelled(id)
   }
   const persistedIds: number[] = []
@@ -220,8 +284,9 @@ async function embed(input: EmbedInput, persist: PersistMeta[] | undefined, id: 
     if (persist.length !== vectors.length) throw new Error('持久化元数据和向量数量不匹配')
     for (let index = 0; index < vectors.length; index += 1) {
       const metadata = persist[index]!
-      persistedIds.push(await (await import('./store')).saveItem({
+      persistedIds.push(await saveItem({
         ...metadata,
+        ...(metadata.modality === 'video' && videoMode ? { videoMode } : {}),
         vec: toArrayBuffer(float32ToFloat16(vectors[index]!)),
       }))
       vectorItems = undefined
@@ -229,18 +294,23 @@ async function embed(input: EmbedInput, persist: PersistMeta[] | undefined, id: 
       report(id, Math.round((index + 1) / vectors.length * 100), metadata.fileKey, '写入向量')
     }
   }
-  return { vectors, elapsedMs: performance.now() - started, persistedIds }
+  const elapsedMs = performance.now() - started
+  if (input.kind === 'video') {
+    console.info('[GemmaSearch] video embedding complete', {
+      videoMode,
+      frameCount: input.frames.length,
+      elapsedMs,
+    })
+  }
+  return { vectors, elapsedMs, persistedIds, videoMode }
 }
 
 async function search(options: SearchOptions, id: number): Promise<unknown> {
   checkCancelled(id)
   if (!currentSettings) throw new Error('引擎尚未初始化')
   const started = performance.now()
-  const signature = JSON.stringify({
-    dtype: currentSettings.dtype,
-    dim: currentSettings.dim,
-    visionTokens: currentSettings.visionTokens,
-  })
+  const signature = currentModelSignature
+  if (!signature) throw new Error('模型签名尚未就绪')
   const libraries = new Map((await listLibraries()).map((library) => [library.id, library]))
   checkCancelled(id)
   if (!vectorItems || !vectorMatrix) {
@@ -259,7 +329,7 @@ async function search(options: SearchOptions, id: number): Promise<unknown> {
   if (queryItemId !== undefined && !query) throw new Error('找不到用于相似搜索的向量')
   const queryVector = query
     ? float16ToFloat32(new Uint16Array(query.vec))
-    : (await getVectors(options.query as EmbedInput))[0]!
+    : options.queryVector || (await getVectors(options.query as EmbedInput, id))[0]!
   checkCancelled(id)
   const allowedLibraries = options.libIds ? new Set(options.libIds) : undefined
   const allowedModalities = options.modalities ? new Set(options.modalities) : undefined
@@ -318,7 +388,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     checkCancelled(request.id)
     switch (request.type) {
       case 'init':
-        value = await init(request.settings, request.id)
+        value = await init(request.settings, request.id, request.splitAudioWasm ?? false)
         break
       case 'embed':
         value = await embed(request.input, request.persist, request.id)

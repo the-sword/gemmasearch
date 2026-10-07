@@ -185,10 +185,12 @@
 .setting-label b { color: var(--text-main); font-size: 10px; font-weight: 550; }
 .setting-label small { color: var(--text-muted); font-size: 9px; line-height: 1.5; }
 .setting-control select { width: 100%; max-width: 235px; min-height: 31px; padding: 0 9px; border: 1px solid var(--border-strong); border-radius: 5px; background: var(--bg-panel); color: var(--text-main); font-size: 10px; }
-.dtype-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
-.dtype-grid label { display: grid; gap: 5px; }
-.dtype-grid label small { color: var(--text-muted); font-size: 8px; }
-.dtype-grid select { padding: 0 5px; }
+.dtype-table { display: grid; gap: 7px; }
+.dtype-row { display: grid; grid-template-columns: 48px repeat(3, minmax(0, 1fr)); align-items: center; gap: 6px; }
+.dtype-row b { color: var(--text-secondary); font-size: 8px; }
+.dtype-row span { color: var(--text-muted); font-size: 8px; }
+.dtype-row select { min-width: 0; padding: 0 4px; }
+.dtype-heading { padding-bottom: 2px; }
 .segmented { display: inline-flex; overflow: hidden; border: 1px solid var(--border-strong); border-radius: 5px; }
 .segmented button { min-width: 42px; height: 28px; padding: 0 8px; border: 0; border-right: 1px solid var(--border); background: var(--bg-panel); color: var(--text-secondary); font-size: 10px; cursor: pointer; }
 .segmented button:last-child { border-right: 0; }
@@ -278,7 +280,7 @@
   .settings-aside { grid-template-columns: 1fr; }
   .setting-row { grid-template-columns: 1fr; gap: 8px; }
   .setting-control select { max-width: none; }
-  .dtype-grid { grid-template-columns: 1fr; }
+  .dtype-row { grid-template-columns: 48px repeat(3, minmax(0, 1fr)); }
   .management-buttons { width: 100%; }
   .management-buttons .button { flex: 1; }
   .top-actions { gap: 9px; }

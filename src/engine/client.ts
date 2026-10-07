@@ -18,6 +18,10 @@ export class EngineClient {
   private readonly worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' })
   private nextId = 1
   private pending = new Map<number, Pending>()
+  private settings: Settings | undefined
+  private splitAudio = false
+  private audioClient: EngineClient | undefined
+  private audioClientPromise: Promise<EngineClient> | undefined
 
   constructor() {
     this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
@@ -65,15 +69,46 @@ export class EngineClient {
     })
   }
 
-  init(settings: Settings, onProgress?: Pending['onProgress'], signal?: AbortSignal): Promise<EngineStatus> {
-    return this.call({ type: 'init', settings }, onProgress, signal)
+  async init(settings: Settings, onProgress?: Pending['onProgress'], signal?: AbortSignal): Promise<EngineStatus> {
+    this.audioClient?.dispose()
+    this.audioClient = undefined
+    this.audioClientPromise = undefined
+    this.settings = settings
+    this.splitAudio = false
+    const status = await this.call<EngineStatus>({
+      type: 'init',
+      settings,
+      splitAudioWasm: settings.modalities.vision && settings.modalities.audio,
+    }, onProgress, signal)
+    this.splitAudio = status.backend === 'wasm' && settings.modalities.vision && settings.modalities.audio
+    return status
   }
 
-  embed(input: EmbedInput, persist?: PersistMeta[], onProgress?: Pending['onProgress'], signal?: AbortSignal): Promise<EmbeddedResult> {
+  async embed(input: EmbedInput, persist?: PersistMeta[], onProgress?: Pending['onProgress'], signal?: AbortSignal): Promise<EmbeddedResult> {
+    if (this.splitAudio && input.kind === 'audio') {
+      const audioClient = await this.getAudioClient(onProgress, signal)
+      const result = await audioClient.embed(input, persist, onProgress, signal)
+      if (persist) await this.refresh()
+      return result
+    }
     return this.call({ type: 'embed', input, persist }, onProgress, signal)
   }
 
-  search(options: SearchOptions, signal?: AbortSignal): Promise<SearchResult> {
+  async search(options: SearchOptions, signal?: AbortSignal): Promise<SearchResult> {
+    if (this.splitAudio && 'kind' in options.query && options.query.kind === 'audio') {
+      const audioClient = await this.getAudioClient(undefined, signal)
+      const embedded = await audioClient.embed(options.query, undefined, undefined, signal)
+      const queryVector = embedded.vectors[0]
+      if (!queryVector) throw new Error('音频查询未生成向量')
+      return this.call({
+        type: 'search',
+        options: {
+          ...options,
+          query: { kind: 'text', text: '', role: 'query' },
+          queryVector,
+        },
+      }, undefined, signal)
+    }
     return this.call({ type: 'search', options }, undefined, signal)
   }
 
@@ -91,5 +126,32 @@ export class EngineClient {
 
   dispose(): void {
     this.worker.terminate()
+    this.audioClient?.dispose()
+    this.audioClient = undefined
+    this.audioClientPromise = undefined
+  }
+
+  private getAudioClient(onProgress?: Pending['onProgress'], signal?: AbortSignal): Promise<EngineClient> {
+    if (!this.settings) return Promise.reject(new Error('引擎尚未初始化'))
+    if (!this.audioClientPromise) {
+      const client = new EngineClient()
+      this.audioClient = client
+      const settings: Settings = {
+        ...this.settings,
+        backend: 'wasm',
+        modalities: { vision: false, audio: true },
+      }
+      this.audioClientPromise = client.init(settings, onProgress, signal)
+        .then(() => client)
+        .catch((error: unknown) => {
+          client.dispose()
+          if (this.audioClient === client) {
+            this.audioClient = undefined
+            this.audioClientPromise = undefined
+          }
+          throw error
+        })
+    }
+    return this.audioClientPromise
   }
 }

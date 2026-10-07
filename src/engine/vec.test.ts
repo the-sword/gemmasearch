@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { calibrateAudioScore, dot, float16ToFloat32, float32ToFloat16, topK, truncateNormalize } from './vec'
+import { calibrateAudioScore, dot, float16ToFloat32, float32ToFloat16, meanNormalize, topK, truncateNormalize } from './vec'
 
 describe('vector helpers', () => {
   it('truncates and renormalizes like the manual calculation', () => {
@@ -7,6 +7,12 @@ describe('vector helpers', () => {
     const result = truncateNormalize(vector, 3)
     const norm = Math.sqrt(14)
     expect([...result]).toEqual([1 / norm, 2 / norm, 3 / norm].map(Math.fround))
+    expect(Math.sqrt(dot(result, result))).toBeCloseTo(1, 6)
+  })
+
+  it('averages vectors and renormalizes the result', () => {
+    const result = meanNormalize([new Float32Array([1, 0]), new Float32Array([0, 1])], 2)
+    expect([...result]).toEqual([Math.SQRT1_2, Math.SQRT1_2].map(Math.fround))
     expect(Math.sqrt(dot(result, result))).toBeCloseTo(1, 6)
   })
 

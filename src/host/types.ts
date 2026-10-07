@@ -1,7 +1,8 @@
-import type { Settings } from '../settings'
+import type { Settings } from '../settings.js'
 
 export type LibraryKind = 'folder' | 'files' | 'imported'
 export type Modality = 'image' | 'video' | 'audio' | 'pdf' | 'text'
+export type VideoMode = 'native' | 'frame-mean'
 
 export interface LibrarySource {
   name: string
@@ -48,6 +49,7 @@ export interface SearchItem {
   page?: number
   chunk?: number
   text?: string
+  videoMode?: VideoMode
   vec: ArrayBuffer
 }
 
@@ -61,9 +63,10 @@ export interface ThumbnailRecord {
 export interface Host {
   kind: 'web' | 'electron'
   pickFolder(): Promise<LibrarySource | null>
-  listFiles(lib: Library): AsyncIterable<FileEntry>
+  listFiles(lib: Library): AsyncIterable<FileEntry> | Promise<FileEntry[]>
   readFile(lib: Library, file: FileEntry): Promise<Blob>
   mediaUrl(lib: Library, file: FileEntry): Promise<string>
+  registerRoots?(paths: string[]): Promise<void>
   watch?(lib: Library, callback: (event: { type: 'add' | 'change' | 'unlink'; path: string }) => void): () => void
   openPath?(lib: Library, file: FileEntry): Promise<void>
   showInFolder?(lib: Library, file: FileEntry): Promise<void>
