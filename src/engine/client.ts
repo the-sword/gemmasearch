@@ -1,5 +1,5 @@
 import type { EngineStatus, EmbedInput, EmbeddedResult, SearchOptions, SearchResult, WorkerRequest, WorkerResponse, PersistMeta } from './protocol'
-import type { Settings } from '../settings'
+import type { Settings, WeightProfile } from '../settings'
 
 type Pending = {
   resolve: (value: unknown) => void
@@ -20,6 +20,7 @@ export class EngineClient {
   private pending = new Map<number, Pending>()
   private settings: Settings | undefined
   private splitAudio = false
+  private effectiveProfile: WeightProfile = 'standard'
   private audioClient: EngineClient | undefined
   private audioClientPromise: Promise<EngineClient> | undefined
 
@@ -81,6 +82,7 @@ export class EngineClient {
       splitAudioWasm: settings.modalities.vision && settings.modalities.audio,
     }, onProgress, signal)
     this.splitAudio = status.backend === 'wasm' && settings.modalities.vision && settings.modalities.audio
+    this.effectiveProfile = status.profile
     return status
   }
 
@@ -139,6 +141,7 @@ export class EngineClient {
       const settings: Settings = {
         ...this.settings,
         backend: 'wasm',
+        weights: this.effectiveProfile,
         modalities: { vision: false, audio: true },
       }
       this.audioClientPromise = client.init(settings, onProgress, signal)

@@ -1,11 +1,12 @@
 export type Dtype = 'fp16' | 'q8' | 'q4' | 'q4f16'
 export type DtypeProfile = { model: Dtype; vision_encoder: Dtype; audio_encoder: Dtype }
+export type WeightProfile = 'standard' | 'gpu-lite'
 export type EffectiveBackend = 'webgpu' | 'wasm'
 
 export interface Settings {
   backend: 'auto' | 'wasm'
   modalities: { vision: boolean; audio: boolean }
-  dtype: { webgpu: DtypeProfile; wasm: DtypeProfile }
+  weights: WeightProfile
   dim: 768 | 512 | 256 | 128
   visionTokens: 70 | 140 | 280 | 560 | 1120
   videoSegmentSec: 8 | 16
@@ -18,10 +19,7 @@ export interface Settings {
 export const DEFAULT_SETTINGS: Settings = {
   backend: 'auto',
   modalities: { vision: true, audio: true },
-  dtype: {
-    webgpu: { model: 'q4', vision_encoder: 'q4', audio_encoder: 'q8' },
-    wasm: { model: 'fp16', vision_encoder: 'fp16', audio_encoder: 'q4' },
-  },
+  weights: 'standard',
   dim: 256,
   visionTokens: 280,
   videoSegmentSec: 16,
@@ -31,50 +29,86 @@ export const DEFAULT_SETTINGS: Settings = {
   lang: 'zh',
 }
 
+export const WEIGHT_PROFILES: Record<WeightProfile, DtypeProfile> = {
+  standard: { model: 'fp16', vision_encoder: 'fp16', audio_encoder: 'q8' },
+  'gpu-lite': { model: 'q4', vision_encoder: 'q4', audio_encoder: 'q8' },
+}
+
+const DOWNLOAD_SIZES_MB: Record<WeightProfile, { model: number; vision: number; audio: number }> = {
+  standard: { model: 542.5, vision: 335.6, audio: 340.3 },
+  'gpu-lite': { model: 174.5, vision: 109.2, audio: 340.3 },
+}
+
 export function normalizeSettings(value: unknown): Settings {
   const saved = value && typeof value === 'object' ? value as Record<string, unknown> : {}
-  const savedDtype = saved.dtype && typeof saved.dtype === 'object'
-    ? saved.dtype as Record<string, unknown>
-    : {}
-  const hasBackendProfiles = 'webgpu' in savedDtype || 'wasm' in savedDtype
-  const oldProfile = savedDtype as Partial<DtypeProfile>
-  const webgpuProfile = savedDtype.webgpu && typeof savedDtype.webgpu === 'object'
-    ? savedDtype.webgpu as Partial<DtypeProfile>
-    : {}
-  const wasmProfile = savedDtype.wasm && typeof savedDtype.wasm === 'object'
-    ? savedDtype.wasm as Partial<DtypeProfile>
-    : {}
+  const normalized = { ...saved }
+  const hasLegacyDtype = Object.prototype.hasOwnProperty.call(normalized, 'dtype')
+  delete normalized.dtype
+  const weights: WeightProfile = hasLegacyDtype
+    ? 'standard'
+    : normalized.weights === 'gpu-lite'
+      ? 'gpu-lite'
+      : 'standard'
 
   return {
     ...DEFAULT_SETTINGS,
-    ...saved,
+    ...normalized,
+    weights,
     modalities: {
       ...DEFAULT_SETTINGS.modalities,
-      ...(saved.modalities && typeof saved.modalities === 'object'
-        ? saved.modalities as Partial<Settings['modalities']>
+      ...(normalized.modalities && typeof normalized.modalities === 'object'
+        ? normalized.modalities as Partial<Settings['modalities']>
         : {}),
     },
-    dtype: hasBackendProfiles
-      ? {
-          webgpu: { ...DEFAULT_SETTINGS.dtype.webgpu, ...webgpuProfile },
-          wasm: { ...DEFAULT_SETTINGS.dtype.wasm, ...wasmProfile },
-        }
-      : {
-          webgpu: { ...DEFAULT_SETTINGS.dtype.webgpu, ...oldProfile },
-          wasm: { ...DEFAULT_SETTINGS.dtype.wasm, ...oldProfile },
-        },
   } as Settings
 }
 
 export function modelSignature(
   settings: Settings,
-  backend: EffectiveBackend = settings.backend === 'wasm' ? 'wasm' : 'webgpu',
-  effectiveDtype: DtypeProfile = settings.dtype[backend],
+  effectiveDtype: DtypeProfile = WEIGHT_PROFILES[settings.weights],
 ): string {
   return JSON.stringify({
-    backend,
     dtype: effectiveDtype,
     dim: settings.dim,
     visionTokens: settings.visionTokens,
   })
+}
+
+export function estimateModelDownloadMB(
+  weights: WeightProfile,
+  modalities: Settings['modalities'],
+): number {
+  const sizes = DOWNLOAD_SIZES_MB[weights]
+  return sizes.model + (modalities.vision ? sizes.vision : 0) + (modalities.audio ? sizes.audio : 0)
+}
+
+export function planEngine({
+  backend,
+  weights,
+  hasWebGPU,
+  shaderF16,
+}: {
+  backend: Settings['backend']
+  weights: WeightProfile
+  hasWebGPU: boolean
+  shaderF16: boolean
+}): { device: EffectiveBackend; profile: WeightProfile; reason?: string } {
+  if (weights === 'standard') {
+    if (backend === 'auto' && hasWebGPU && shaderF16) return { device: 'webgpu', profile: 'standard' }
+    if (backend === 'auto' && hasWebGPU) {
+      return {
+        device: 'wasm',
+        profile: 'standard',
+        reason: 'GPU 不支持 shader-f16，改用 CPU 运行同一套权重',
+      }
+    }
+    return { device: 'wasm', profile: 'standard' }
+  }
+
+  if (backend === 'auto' && hasWebGPU) return { device: 'webgpu', profile: 'gpu-lite' }
+  return {
+    device: 'wasm',
+    profile: 'standard',
+    reason: 'CPU 无法加载轻量权重，已改用标准权重（需重建索引）',
+  }
 }

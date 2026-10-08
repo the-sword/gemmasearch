@@ -10,7 +10,15 @@ import {
 } from '@huggingface/transformers'
 import type { Processor, PreTrainedModel } from '@huggingface/transformers'
 import type { SearchItem, Modality, VideoMode } from '../host/types'
-import { modelSignature, type DtypeProfile, type EffectiveBackend, type Settings } from '../settings'
+import {
+  modelSignature,
+  planEngine,
+  WEIGHT_PROFILES,
+  type DtypeProfile,
+  type EffectiveBackend,
+  type Settings,
+  type WeightProfile,
+} from '../settings'
 import { float16ToFloat32, float32ToFloat16, meanNormalize, topK, truncateNormalize, calibrateAudioScore } from './vec'
 import { getItems, listLibraries, removeFileRecords, removeLibrary, saveItem } from './store'
 import type { EmbedInput, EngineStatus, ImageInput, PersistMeta, SearchHit, SearchOptions, WorkerRequest, WorkerResponse } from './protocol'
@@ -144,17 +152,12 @@ async function getVectors(input: EmbedInput, id: number): Promise<Float32Array[]
 async function loadBackend(
   settings: Settings,
   device: EffectiveBackend,
+  profile: WeightProfile,
   id: number,
-  shaderF16: boolean,
   splitAudio = false,
 ): Promise<{ dtype: DtypeProfile; loadMs: number }> {
   const started = performance.now()
-  const dtype = { ...settings.dtype[device] }
-  if (device === 'webgpu' && dtype.model === 'fp16' && !shaderF16) {
-    dtype.model = 'q4'
-    dtype.vision_encoder = 'q4'
-    dtype.audio_encoder = 'q4'
-  }
+  const dtype = { ...WEIGHT_PROFILES[profile] }
   const config = await AutoConfig.from_pretrained(MODEL_ID)
   const modalityConfig = config as typeof config & { vision_config?: unknown; audio_config?: unknown }
   if (!settings.modalities.vision) modalityConfig.vision_config = null
@@ -197,43 +200,63 @@ async function init(settings: Settings, id: number, splitAudioWasm: boolean): Pr
   const started = performance.now()
   let adapterName: string | undefined
   let shaderF16 = false
-  let fallbackReason: string | undefined
+  let adapter: GPUAdapter | null = null
+  let adapterError: string | undefined
   if (settings.backend === 'auto' && navigator.gpu) {
     try {
-      const adapter = await navigator.gpu.requestAdapter()
-      if (adapter) {
-        adapterName = adapter.info?.description || adapter.info?.device
-        shaderF16 = adapter.features.has('shader-f16')
-        const loaded = await loadBackend(settings, 'webgpu', id, shaderF16)
-        checkCancelled(id)
-        const selfTest = await getVectors({ kind: 'text', text: 'a photograph', role: 'query' }, id)
-        checkCancelled(id)
-        const norm = Math.sqrt(selfTest[0]?.reduce((sum, value) => sum + value * value, 0) || 0)
-        if (!Number.isFinite(norm) || norm <= 0) throw new Error('WebGPU 自检向量无效')
-        currentModelSignature = modelSignature(settings, 'webgpu', loaded.dtype)
-        return {
-          backend: 'webgpu',
-          adapter: adapterName,
-          shaderF16,
-          loadMs: performance.now() - started,
-          actualDtype: loaded.dtype,
-        }
-      }
-      fallbackReason = '未找到可用的 WebGPU adapter'
+      adapter = await navigator.gpu.requestAdapter()
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') throw error
-      fallbackReason = error instanceof Error ? error.message : String(error)
+      adapterError = error instanceof Error ? error.message : String(error)
+    }
+  }
+  if (adapter) {
+    adapterName = adapter.info?.description || adapter.info?.device
+    shaderF16 = adapter.features.has('shader-f16')
+  }
+  let plan = planEngine({
+    backend: settings.backend,
+    weights: settings.weights,
+    hasWebGPU: Boolean(adapter),
+    shaderF16,
+  })
+  let fallbackReason = plan.reason
+  if (!adapter && !fallbackReason) {
+    fallbackReason = settings.backend === 'wasm'
+      ? '已强制使用 WASM'
+      : adapterError || (navigator.gpu ? '未找到可用的 WebGPU adapter' : '浏览器未提供 WebGPU')
+  }
+  if (plan.device === 'webgpu') {
+    try {
+      const loaded = await loadBackend(settings, 'webgpu', plan.profile, id)
+      checkCancelled(id)
+      const selfTest = await getVectors({ kind: 'text', text: 'a photograph', role: 'query' }, id)
+      checkCancelled(id)
+      const norm = Math.sqrt(selfTest[0]?.reduce((sum, value) => sum + value * value, 0) || 0)
+      if (!Number.isFinite(norm) || norm <= 0) throw new Error('WebGPU 自检向量无效')
+      currentModelSignature = modelSignature(settings, loaded.dtype)
+      return {
+        backend: 'webgpu',
+        profile: plan.profile,
+        adapter: adapterName,
+        shaderF16,
+        loadMs: performance.now() - started,
+        actualDtype: loaded.dtype,
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') throw error
+      const detail = error instanceof Error ? error.message : String(error)
+      fallbackReason = `WebGPU 初始化失败：${detail}；已改用 CPU 标准权重`
       disposeModel()
       processor = undefined
+      plan = { device: 'wasm', profile: 'standard' }
     }
-  } else {
-    fallbackReason = settings.backend === 'wasm' ? '已强制使用 WASM' : '浏览器未提供 WebGPU'
   }
   const loaded = await loadBackend(
     settings,
     'wasm',
+    plan.profile,
     id,
-    false,
     splitAudioWasm && settings.modalities.vision && settings.modalities.audio,
   )
   checkCancelled(id)
@@ -242,9 +265,10 @@ async function init(settings: Settings, id: number, splitAudioWasm: boolean): Pr
   if (!selfTest[0]?.every(Number.isFinite) || Math.sqrt(selfTest[0]?.reduce((sum, value) => sum + value * value, 0) || 0) <= 0) {
     throw new Error('WASM 自检向量无效')
   }
-  currentModelSignature = modelSignature(settings, 'wasm', loaded.dtype)
+  currentModelSignature = modelSignature(settings, loaded.dtype)
   return {
     backend: 'wasm',
+    profile: plan.profile,
     adapter: adapterName,
     shaderF16,
     fallbackReason,

@@ -1,5 +1,5 @@
 import type { FileRecord, Library, SearchItem, ThumbnailRecord } from '../host/types'
-import { modelSignature, type DtypeProfile, type EffectiveBackend, type Settings } from '../settings'
+import { modelSignature, type DtypeProfile, type Settings } from '../settings'
 import { getDatabase, getFiles, getItems, getThumb, listLibraries, saveFile, saveLibrary } from './store'
 import { decodeIndexPack, encodeIndexPack, type PackPayload } from './pack'
 import { float32ToFloat16 } from './vec'
@@ -62,7 +62,6 @@ export async function exportLibraryPack(library: Library): Promise<Blob> {
 export async function importLibraryPack(
   file: Blob,
   settings: Settings,
-  backend?: EffectiveBackend,
   effectiveDtype?: DtypeProfile,
 ): Promise<{ library: Library; mismatch: boolean }> {
   const bytes = new Uint8Array(await file.arrayBuffer())
@@ -110,7 +109,7 @@ export async function importLibraryPack(
     await tx.objectStore('thumbs').put(record)
   }
   await tx.done
-  return { library, mismatch: library.modelSig !== modelSignature(settings, backend, effectiveDtype) }
+  return { library, mismatch: library.modelSig !== modelSignature(settings, effectiveDtype) }
 }
 
 export async function listImportedLibraries(): Promise<Library[]> {

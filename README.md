@@ -63,6 +63,12 @@ npm run dist:mac        # macOS x64/arm64 zip
 
 Windows 打包脚本需要 Docker，并使用 `electronuserland/builder:wine`。macOS zip 在 Linux 上生成未签名包；在 macOS CI 上会执行 ad-hoc `codesign`，不进行 notarization。
 
+## 模型权重与运行后端
+
+默认“标准”权重由 WebGPU 与 WASM 共用：文本模型和视觉编码器使用 fp16，音频编码器使用 q8。WASM 的 ONNX Runtime 不支持 `GatherBlockQuantized`，因此量化文本模型和视觉编码器无法在 CPU 上运行。自动模式只有在 GPU 支持 `shader-f16` 时才会使用 WebGPU 标准权重；否则会改用 WASM，并保持同一套权重。
+
+“GPU 轻量”使用 q4 文本模型与视觉编码器、q8 音频编码器，可减少下载量，但只适用于 WebGPU。强制使用 CPU、没有可用 GPU，或 WebGPU 初始化失败时，应用会切回标准权重；由于两种 profile 的向量不同，索引签名会提示重建。标准 profile 的签名不区分 WebGPU/WASM，因此同一索引可在两种后端间复用。
+
 ## 隐私与限制
 
-本项目默认使用 WebGPU，无法使用时回退到多线程 WASM。不同后端或精度产生的向量不会混用，切换后需要重建索引。浏览器和 Electron 均不提供云端向量数据库或远程推理服务。
+浏览器和 Electron 均不提供云端向量数据库或远程推理服务。模型推理、索引和搜索在本机完成，联网仅用于首次下载模型文件。

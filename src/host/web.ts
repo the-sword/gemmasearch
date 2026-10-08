@@ -1,4 +1,4 @@
-import { modelSignature, type Settings } from '../settings'
+import { modelSignature, type DtypeProfile, type Settings } from '../settings'
 import type { FileEntry, Host, Library, LibrarySource } from './types'
 
 type DirectoryHandle = FileSystemDirectoryHandle & {
@@ -15,7 +15,12 @@ function makeId(): string {
   return crypto.randomUUID()
 }
 
-export function createFilesLibrary(files: File[], settings: Settings, name?: string): Library {
+export function createFilesLibrary(
+  files: File[],
+  settings: Settings,
+  name?: string,
+  effectiveDtype?: DtypeProfile,
+): Library {
   const id = makeId()
   const token = `session:${id}`
   const entries = new Map<string, File>()
@@ -26,7 +31,7 @@ export function createFilesLibrary(files: File[], settings: Settings, name?: str
     name: name || (files[0]?.webkitRelativePath.split('/')[0] || '临时文件'),
     kind: 'files',
     rootPath: token,
-    modelSig: modelSignature(settings),
+    modelSig: modelSignature(settings, effectiveDtype),
     createdAt: Date.now(),
   }
 }

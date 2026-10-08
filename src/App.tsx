@@ -9,16 +9,21 @@ import { createFilesLibrary, forgetSessionLibrary, hasSessionLibrary } from './h
 import { Indexer, type IndexProgress } from './indexer/indexer'
 import { translate } from './i18n'
 import { decodeAudio, decodeMedia } from './media/decode'
-import { DEFAULT_SETTINGS, modelSignature, normalizeSettings, type Dtype, type EffectiveBackend, type Settings } from './settings'
+import {
+  DEFAULT_SETTINGS,
+  estimateModelDownloadMB,
+  modelSignature,
+  normalizeSettings,
+  WEIGHT_PROFILES,
+  type Settings,
+  type WeightProfile,
+} from './settings'
 import { Icon } from './ui/Icons'
 import './App.css'
 
 type Page = 'search' | 'detail' | 'libraries' | 'settings' | 'onboarding'
 type EnrichedHit = SearchHit & { file?: FileRecord; thumb?: ThumbnailRecord }
 const MODALITIES: Modality[] = ['image', 'video', 'audio', 'pdf', 'text']
-const DTYPE_FIELDS = ['model', 'vision_encoder', 'audio_encoder'] as const
-const DTYPE_LABELS = { model: '文本模型', vision_encoder: '视觉编码器', audio_encoder: '音频编码器' } as const
-
 function fileExtension(path: string): string {
   return path.split('.').at(-1)?.toUpperCase() || 'FILE'
 }
@@ -62,9 +67,9 @@ function App() {
   const loadedSettings = useRef('')
   const recorder = useRef<MediaRecorder | null>(null)
   const t = (key: Parameters<typeof translate>[1]) => translate(settings, key)
-  const activeBackend: EffectiveBackend = engineStatus?.backend ?? (settings.backend === 'wasm' ? 'wasm' : 'webgpu')
-  const activeDtype = engineStatus?.actualDtype ?? settings.dtype[activeBackend]
-  const activeModelSignature = modelSignature(settings, activeBackend, activeDtype)
+  const activeDtype = engineStatus?.actualDtype ?? WEIGHT_PROFILES[settings.weights]
+  const activeProfile = engineStatus?.profile ?? settings.weights
+  const activeModelSignature = modelSignature(settings, activeDtype)
 
   useEffect(() => {
     if (!queryImage) {
@@ -127,13 +132,6 @@ function App() {
     void saveSetting('settings', nextSettings)
   }
 
-  const updateDtype = (backend: EffectiveBackend, key: typeof DTYPE_FIELDS[number], value: Dtype) => {
-    const dtype = backend === 'webgpu'
-      ? { ...settings.dtype, webgpu: { ...settings.dtype.webgpu, [key]: value } }
-      : { ...settings.dtype, wasm: { ...settings.dtype.wasm, [key]: value } }
-    updateSettings({ dtype })
-  }
-
   const startIndexing = useCallback(async (library: Library) => {
     if (indexers.current.has(library.id)) {
       queuedRescans.current.add(library.id)
@@ -141,7 +139,7 @@ function App() {
     }
     try {
       const engine = await ensureEngine()
-      const signature = modelSignature(settings, engineStatusRef.current?.backend, engineStatusRef.current?.actualDtype)
+      const signature = modelSignature(settings, engineStatusRef.current?.actualDtype)
       if (library.modelSig !== signature) {
         for (const file of await getFiles(library.id)) await engine.removeFile(`${library.id}:${file.path}`)
       }
@@ -167,7 +165,7 @@ function App() {
 
   const addFiles = async (selected: File[]) => {
     if (!selected.length) return
-    const library = createFilesLibrary(selected, settings)
+    const library = createFilesLibrary(selected, settings, undefined, engineStatusRef.current?.actualDtype)
     await saveLibrary(library)
     await refreshData()
     setPage('libraries')
@@ -184,7 +182,7 @@ function App() {
         kind: host.kind === 'electron' || source.handle ? 'folder' : 'files',
         rootPath: source.rootPath,
         handle: source.handle,
-        modelSig: modelSignature(settings),
+        modelSig: modelSignature(settings, engineStatusRef.current?.actualDtype),
         createdAt: Date.now(),
       }
       await saveLibrary(library)
@@ -238,7 +236,7 @@ function App() {
     }
     try {
       const engine = await ensureEngine()
-      const signature = modelSignature(settings, engineStatusRef.current?.backend, engineStatusRef.current?.actualDtype)
+      const signature = modelSignature(settings, engineStatusRef.current?.actualDtype)
       const compatibleLibraries = libraries
         .filter((library) => library.modelSig === signature)
         .filter((library) => !selectedLibraries.length || selectedLibraries.includes(library.id))
@@ -352,7 +350,6 @@ function App() {
       const { library, mismatch } = await importLibraryPack(
         file,
         settings,
-        engineStatusRef.current?.backend,
         engineStatusRef.current?.actualDtype,
       )
       await engineRef.current?.refresh()
@@ -438,7 +435,7 @@ function App() {
           <input ref={fileInput} hidden type="file" multiple onChange={(event) => { const selected = Array.from(event.target.files || []); event.currentTarget.value = ''; void addFiles(selected) }} />
         </div>
         <div className="status-footer">
-          <div className="status-row"><span className={`status-dot ${engineStatus ? 'ready' : ''}`} />{engineStatus ? engineStatus.backend.toUpperCase() : '模型未加载'}</div>
+          <div className="status-row"><span className={`status-dot ${engineStatus ? 'ready' : ''}`} />{engineStatus ? `${engineStatus.backend.toUpperCase()} · ${activeProfile}` : '模型未加载'}</div>
           {busy && <div className="mini-progress"><i style={{ width: `${loadProgress.percent}%` }} /></div>}
           {engineStatus && <div className="status-caption">{engineStatus.actualDtype.model} · {engineStatus.actualDtype.vision_encoder} · {engineStatus.actualDtype.audio_encoder}</div>}
           {Object.entries(progress).filter(([, item]) => item.total > 0).slice(0, 1).map(([id, item]) => <div className="status-caption" key={id}>索引中 {item.done}/{item.total}</div>)}
@@ -462,6 +459,14 @@ function App() {
                 <label className="capability"><input type="checkbox" checked={settings.modalities.vision} onChange={(event) => updateSettings({ modalities: { ...settings.modalities, vision: event.target.checked } })} /><Icon name="image" /><span><b>图片与视频</b><small>视觉内容检索</small></span></label>
                 <label className="capability"><input type="checkbox" checked={settings.modalities.audio} onChange={(event) => updateSettings({ modalities: { ...settings.modalities, audio: event.target.checked } })} /><Icon name="audio" /><span><b>音频</b><small>声音与录音检索</small></span></label>
               </div>
+              <div className="onboarding-weights">
+                <h2>模型权重</h2>
+                <WeightProfilePicker
+                  settings={settings}
+                  name="onboarding-weights"
+                  onChange={(weights) => updateSettings({ weights })}
+                />
+              </div>
               <button className="button primary welcome-button" disabled={busy} onClick={() => {
                 void ensureEngine(true).then(() => {
                   void saveSetting('onboardingComplete', true)
@@ -469,7 +474,7 @@ function App() {
                   setToast('模型已就绪，可添加文件')
                 }).catch((error: unknown) => setToast(error instanceof Error ? error.message : '模型加载失败'))
               }}>{busy ? `${t('modelDownload')} ${loadProgress.percent}%` : '加载模型并开始'}<span>→</span></button>
-              <div className="welcome-details"><span className={`gpu-pill ${navigator.gpu ? 'available' : ''}`}>◈ {navigator.gpu ? 'WebGPU 可用' : '将使用 WASM CPU'}</span><span>WebGPU q4 · WASM fp16 · 默认 256 维</span></div>
+              <div className="welcome-details"><span className={`gpu-pill ${navigator.gpu ? 'available' : ''}`}>◈ {navigator.gpu ? 'WebGPU 可用' : '将使用 WASM CPU'}</span><span>默认 256 维</span></div>
               {busy && <div className="load-track"><i style={{ width: `${loadProgress.percent}%` }} /></div>}
               {loadProgress.file && <small className="load-file">{loadProgress.file}</small>}
             </div>
@@ -548,28 +553,12 @@ function App() {
             <div className="settings-columns"><div className="settings-main panel">
               <div className="setting-section"><h2>模型与推理</h2>
                 <SettingRow title="推理后端" hint="自动优先使用 WebGPU，不可用时回退到 WASM。"><select value={settings.backend} onChange={(event) => updateSettings({ backend: event.target.value as Settings['backend'] })}><option value="auto">自动（WebGPU → WASM）</option><option value="wasm">WASM CPU</option></select></SettingRow>
-                <SettingRow title="模型精度" hint="按推理后端分别配置；更改后需重建对应索引。">
-                  <div className="dtype-table">
-                    <div className="dtype-row dtype-heading"><span>后端</span>{DTYPE_FIELDS.map((key) => <span key={key}>{DTYPE_LABELS[key]}</span>)}</div>
-                    {(['webgpu', 'wasm'] as const).map((backend) => (
-                      <div className="dtype-row" key={backend}>
-                        <b>{backend === 'webgpu' ? 'WebGPU' : 'WASM'}</b>
-                        {DTYPE_FIELDS.map((key) => (
-                          <select
-                            key={key}
-                            aria-label={`${backend} ${DTYPE_LABELS[key]}`}
-                            value={settings.dtype[backend][key]}
-                            onChange={(event) => updateDtype(backend, key, event.target.value as Dtype)}
-                          >
-                            <option value="q4">q4</option>
-                            <option value="q8">q8</option>
-                            <option value="q4f16">q4f16</option>
-                            <option value="fp16">fp16</option>
-                          </select>
-                        ))}
-                      </div>
-                    ))}
-                  </div>
+                <SettingRow title="模型权重" hint="标准权重可由 GPU 与 CPU 共用；GPU 轻量模式更省下载空间。">
+                  <WeightProfilePicker
+                    settings={settings}
+                    name="settings-weights"
+                    onChange={(weights) => updateSettings({ weights })}
+                  />
                 </SettingRow>
                 <SettingRow title="向量维度" hint="维度越低，占用空间越小。更改后需重建索引。"><div className="segmented">{([768, 512, 256, 128] as const).map((dim) => <button key={dim} className={settings.dim === dim ? 'active' : ''} onClick={() => updateSettings({ dim })}>{dim}</button>)}</div></SettingRow>
                 <SettingRow title="视觉 Token 预算" hint="更高预算可保留更多图片细节，但推理更慢。"><select value={settings.visionTokens} onChange={(event) => updateSettings({ visionTokens: Number(event.target.value) as Settings['visionTokens'] })}>{[70, 140, 280, 560, 1120].map((value) => <option key={value} value={value}>{value} tokens</option>)}</select></SettingRow>
@@ -578,7 +567,7 @@ function App() {
               <div className="setting-section"><h2>索引性能</h2><SettingRow title="视频片段" hint="视频按时间段抽帧并分别编码。"><select value={settings.videoSegmentSec} onChange={(event) => updateSettings({ videoSegmentSec: Number(event.target.value) as Settings['videoSegmentSec'] })}><option value={8}>8 秒</option><option value={16}>16 秒</option></select></SettingRow><SettingRow title="音频片段" hint="长音频拆分为连续片段。"><select value={settings.audioSegmentSec} onChange={(event) => updateSettings({ audioSegmentSec: Number(event.target.value) as Settings['audioSegmentSec'] })}><option value={30}>30 秒</option><option value={60}>60 秒</option></select></SettingRow><SettingRow title="索引速度" hint="低速会在批次间增加间隔。"><select value={settings.indexSpeed} onChange={(event) => updateSettings({ indexSpeed: event.target.value as Settings['indexSpeed'] })}><option value="low">低 · 200 ms</option><option value="mid">中 · 50 ms</option><option value="high">高 · 无间隔</option></select></SettingRow></div>
               <div className="setting-section"><h2>界面与网络</h2><SettingRow title="模型来源" hint="可切换 Hugging Face 镜像站点。"><select value={settings.modelHost} onChange={(event) => updateSettings({ modelHost: event.target.value as Settings['modelHost'] })}><option value="hf">Hugging Face</option><option value="mirror">HF Mirror</option></select></SettingRow><SettingRow title={t('language')}><select value={settings.lang} onChange={(event) => updateSettings({ lang: event.target.value as Settings['lang'] })}><option value="zh">简体中文</option><option value="en">English</option></select></SettingRow></div>
             </div><aside className="settings-aside">
-              <div className="panel backend-panel"><div className="panel-header"><h3>运行状态</h3><span className={`state-badge ${engineStatus ? 'ready' : ''}`}>{engineStatus?.backend || '未加载'}</span></div><dl><dt>设备</dt><dd>{engineStatus?.adapter || (engineStatus?.backend === 'wasm' ? 'CPU' : '—')}</dd><dt>模型精度</dt><dd>{activeDtype.model}</dd><dt>模型加载</dt><dd>{engineStatus ? `${(engineStatus.loadMs / 1000).toFixed(1)} 秒` : '待启动'}</dd></dl>{engineStatus?.fallbackReason && <p className="fallback-note">{engineStatus.fallbackReason}</p>}</div>
+              <div className="panel backend-panel"><div className="panel-header"><h3>运行状态</h3><span className={`state-badge ${engineStatus ? 'ready' : ''}`}>{engineStatus ? `${engineStatus.backend} · ${engineStatus.profile}` : '未加载'}</span></div><dl><dt>设备</dt><dd>{engineStatus?.adapter || (engineStatus?.backend === 'wasm' ? 'CPU' : '—')}</dd><dt>模型精度</dt><dd>{activeDtype.model}</dd><dt>模型加载</dt><dd>{engineStatus ? `${(engineStatus.loadMs / 1000).toFixed(1)} 秒` : '待启动'}</dd></dl>{engineStatus?.fallbackReason && <p className="fallback-note">{engineStatus.fallbackReason}</p>}</div>
               <div className="panel cache-panel"><span className="cache-icon">⌁</span><h3>模型缓存</h3><p>已下载的模型会保存在此浏览器中，清理后下次使用需要重新下载。</p><button className="button secondary full" onClick={async () => { await caches.delete('transformers-cache'); setToast('模型缓存已清理') }}>清理模型缓存</button></div>
               <div className="privacy-card"><b>隐私设计</b><p>文本、媒体和索引向量均在浏览器中处理。联网仅用于首次获取模型文件。</p></div>
             </aside></div>
@@ -619,6 +608,41 @@ function DetailImage({ blob, alt }: { blob: Blob; alt: string }) {
 
 function SettingRow({ title, hint, children }: { title: string; hint?: string; children: ReactNode }) {
   return <div className="setting-row"><div className="setting-label"><b>{title}</b>{hint && <small>{hint}</small>}</div><div className="setting-control">{children}</div></div>
+}
+
+function WeightProfilePicker({
+  settings,
+  name,
+  onChange,
+}: {
+  settings: Settings
+  name: string
+  onChange: (weights: WeightProfile) => void
+}) {
+  const options: Array<{ value: WeightProfile; title: string; detail: string }> = [
+    { value: 'standard', title: '标准（GPU/CPU 通用）', detail: 'GPU 与 CPU 使用同一套模型权重' },
+    { value: 'gpu-lite', title: 'GPU 轻量', detail: '仅 GPU 使用；退回 CPU 时需要重建索引' },
+  ]
+  return (
+    <div className="weight-options" role="radiogroup" aria-label="模型权重">
+      {options.map((option) => (
+        <label className={`weight-option ${settings.weights === option.value ? 'selected' : ''}`} key={option.value}>
+          <input
+            type="radio"
+            name={name}
+            value={option.value}
+            checked={settings.weights === option.value}
+            onChange={() => onChange(option.value)}
+          />
+          <span className="weight-option-copy">
+            <b>{option.value === 'gpu-lite' ? `${option.title}（仅 GPU 使用；退回 CPU 时需要重建索引）` : option.title}</b>
+            {option.value === 'standard' && <small>{option.detail}</small>}
+          </span>
+          <strong>约 {estimateModelDownloadMB(option.value, settings.modalities).toLocaleString('zh-CN', { maximumFractionDigits: 1 })} MB</strong>
+        </label>
+      ))}
+    </div>
+  )
 }
 
 function VideoDetail({ library, file, hit }: { library: Library; file: FileRecord; hit: EnrichedHit }) {
