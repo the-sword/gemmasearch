@@ -36,6 +36,9 @@ let vectorMatrix: Float32Array | undefined
 const activeRequests = new Set<number>()
 const cancelledRequests = new Set<number>()
 let videoTokenBudgetLogged = false
+// Once native video embedding hits std::bad_alloc on WASM, every later segment
+// fails the same way — skip the doomed attempt and go straight to frame-mean.
+let wasmNativeVideoFailed = false
 
 async function disposeModel(): Promise<void> {
   try {
@@ -132,23 +135,34 @@ async function getVectorsDetailed(
   id: number,
 ): Promise<{ vectors: Float32Array[]; videoMode?: VideoMode }> {
   if (input.kind !== 'video') return { vectors: await runModelVectors(input, id) }
-  try {
-    return { vectors: await runModelVectors(input, id), videoMode: 'native' }
-  } catch (error) {
-    if (backend !== 'wasm' || !isWasmBadAlloc(error)) throw error
-    console.warn('[GemmaSearch] native video embedding hit std::bad_alloc; using frame-mean fallback')
-    const frameVectors: Float32Array[] = []
-    for (const frame of input.frames) {
-      checkCancelled(id)
-      const [vector] = await runModelVectors(
-        { kind: 'image', data: frame.data, width: frame.width, height: frame.height },
-        id,
-      )
-      if (vector) frameVectors.push(vector)
+  if (!(backend === 'wasm' && wasmNativeVideoFailed)) {
+    try {
+      return { vectors: await runModelVectors(input, id), videoMode: 'native' }
+    } catch (error) {
+      if (backend !== 'wasm' || !isWasmBadAlloc(error)) throw error
+      wasmNativeVideoFailed = true
+      console.warn('[GemmaSearch] native video embedding hit std::bad_alloc; using frame-mean fallback for remaining videos')
     }
-    if (frameVectors.length === 0) throw new Error('视频不包含可嵌入帧', { cause: error })
-    return { vectors: [meanNormalize(frameVectors, currentSettings!.dim)], videoMode: 'frame-mean' }
   }
+  const frameVectors: Float32Array[] = []
+  const batchSize = Math.min(8, Math.max(1, Math.floor(2700 / (currentSettings?.visionTokens || 280))))
+  for (let offset = 0; offset < input.frames.length; offset += batchSize) {
+    checkCancelled(id)
+    const vectors = await runModelVectors(
+      {
+        kind: 'images',
+        images: input.frames.slice(offset, offset + batchSize).map((frame) => ({
+          data: frame.data,
+          width: frame.width,
+          height: frame.height,
+        })),
+      },
+      id,
+    )
+    frameVectors.push(...vectors)
+  }
+  if (frameVectors.length === 0) throw new Error('视频不包含可嵌入帧')
+  return { vectors: [meanNormalize(frameVectors, currentSettings!.dim)], videoMode: 'frame-mean' }
 }
 
 async function getVectors(input: EmbedInput, id: number): Promise<Float32Array[]> {
@@ -194,6 +208,7 @@ async function init(settings: Settings, id: number, splitAudioWasm: boolean): Pr
   currentSettings = settings
   currentModelSignature = undefined
   videoTokenBudgetLogged = false
+  wasmNativeVideoFailed = false
   vectorItems = undefined
   vectorMatrix = undefined
   const modelHost = await resolveModelHost(settings.modelHost)
