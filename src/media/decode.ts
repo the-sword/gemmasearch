@@ -24,6 +24,13 @@ export interface DecodedFile {
   pages?: number
 }
 
+export interface DecodeHandlers {
+  /** Called as each chunk is produced so callers can embed while decoding continues. */
+  onChunks?: (chunks: DecodedChunk[]) => void | Promise<void>
+  /** Called after each sampled video frame: (sampled so far, total to sample). */
+  onProgress?: (done: number, total: number) => void
+}
+
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'avif'])
 const VIDEO_EXTENSIONS = new Set(['mp4', 'webm', 'mov', 'm4v', 'mkv'])
 const AUDIO_EXTENSIONS = new Set(['mp3', 'wav', 'm4a', 'aac', 'ogg', 'opus', 'flac'])
@@ -72,65 +79,161 @@ async function imageData(blob: Blob, maxSide = 512): Promise<{ data: Uint8Clampe
   return { data, width, height, thumb: await canvasBlob(thumbCanvas) }
 }
 
-type MediaSource = Blob | string
+export type MediaSource = Blob | string
 
-async function decodeVideo(source: MediaSource, settings: Settings): Promise<DecodedFile> {
-  const url = typeof source === 'string' ? source : URL.createObjectURL(source)
-  const ownsUrl = typeof source !== 'string' || source.startsWith('blob:')
+interface VideoFrame {
+  data: Uint8ClampedArray
+  width: number
+  height: number
+  timestamp: number
+}
+
+const MAX_VIDEO_SEGMENTS = 120
+const VIDEO_FRAMES_PER_SEGMENT = 8
+const MIN_SAMPLE_INTERVAL_SEC = 0.5
+const MAX_DECODE_LANES = 3
+const SEGMENTS_PER_LANE = 8
+
+export function planVideoSampling(
+  duration: number,
+  settings: Settings,
+): { interval: number; segmentSeconds: number; framesPerSegment: number } {
+  const segmentSeconds = Math.max(settings.videoSegmentSec, Math.ceil(duration / MAX_VIDEO_SEGMENTS))
+  const interval = Math.max(MIN_SAMPLE_INTERVAL_SEC, segmentSeconds / VIDEO_FRAMES_PER_SEGMENT)
+  const framesPerSegment = Math.max(1, Math.floor(segmentSeconds / interval))
+  return { interval, segmentSeconds, framesPerSegment }
+}
+
+function videoElement(url: string): HTMLVideoElement {
   const video = document.createElement('video')
   video.crossOrigin = 'anonymous'
   video.src = url
   video.muted = true
   video.preload = 'auto'
+  return video
+}
+
+function metadataReady(video: HTMLVideoElement): Promise<void> {
+  if (video.readyState >= 1) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    video.onloadedmetadata = () => resolve()
+    video.onerror = () => reject(new Error('无法解码（编码格式不受支持）'))
+  })
+}
+
+function releaseVideo(video: HTMLVideoElement): void {
+  video.removeAttribute('src')
+  video.load()
+}
+
+async function thumbFromFrame(frame: VideoFrame): Promise<Blob> {
+  const bitmap = await createImageBitmap(
+    new ImageData(frame.data as Uint8ClampedArray<ArrayBuffer>, frame.width, frame.height),
+  )
+  const scale = Math.min(1, 320 / Math.max(bitmap.width, bitmap.height))
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale))
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale))
+  canvas.getContext('2d')?.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
+  bitmap.close()
+  return canvasBlob(canvas)
+}
+
+async function decodeVideo(source: MediaSource, settings: Settings, handlers?: DecodeHandlers): Promise<DecodedFile> {
+  const url = typeof source === 'string' ? source : URL.createObjectURL(source)
+  const ownsUrl = typeof source !== 'string' || source.startsWith('blob:')
+  const probe = videoElement(url)
+  let probeInLane = false
   try {
-    await new Promise<void>((resolve, reject) => {
-      video.onloadedmetadata = () => resolve()
-      video.onerror = () => reject(new Error('无法解码（编码格式不受支持）'))
-    })
-    const duration = video.duration
-    const stride = duration > 1800
-      ? Math.max(1, Math.ceil(duration / (120 * settings.videoSegmentSec)))
-      : 1
-    const interval = Math.max(1, stride)
-    const segmentSeconds = Math.max(settings.videoSegmentSec, Math.ceil(duration / 120))
-    const samples: Array<{ data: Uint8ClampedArray; width: number; height: number; timestamp: number; thumb?: Blob }> = []
-    const posterIndex = Math.floor(Math.max(0, (duration - 0.5) / interval) * 0.1)
-    for (let time = 0.5; time < duration; time += interval) {
-      await seek(video, time)
-      const scale = Math.min(1, 512 / Math.max(video.videoWidth, video.videoHeight))
-      const canvas = document.createElement('canvas')
-      canvas.width = Math.max(1, Math.round(video.videoWidth * scale))
-      canvas.height = Math.max(1, Math.round(video.videoHeight * scale))
-      const context = canvas.getContext('2d', { willReadFrequently: true })
-      if (!context) continue
-      context.drawImage(video, 0, 0, canvas.width, canvas.height)
-      samples.push({
-        data: context.getImageData(0, 0, canvas.width, canvas.height).data,
-        width: canvas.width,
-        height: canvas.height,
-        timestamp: time,
-        thumb: samples.length === posterIndex ? await canvasBlob(canvas) : undefined,
-      })
-    }
+    await metadataReady(probe)
+    const duration = probe.duration
+    const { interval, framesPerSegment } = planVideoSampling(duration, settings)
+    const times: number[] = []
+    for (let time = 0.5; time < duration; time += interval) times.push(time)
+    if (times.length === 0 && duration > 0) times.push(Math.max(0, duration / 2))
+    const totalSegments = Math.ceil(times.length / framesPerSegment)
+    const laneCount = Math.min(MAX_DECODE_LANES, Math.max(1, Math.ceil(totalSegments / SEGMENTS_PER_LANE)))
+    const segmentsPerLane = Math.ceil(totalSegments / laneCount)
     const chunks: DecodedChunk[] = []
-    const frameCount = Math.max(1, Math.floor(segmentSeconds / interval))
-    for (let offset = 0; offset < samples.length; offset += frameCount) {
-      const segment = samples.slice(offset, offset + frameCount)
-      if (!segment.length) continue
+    let sampled = 0
+    let aborted = false
+    const emitSegment = async (segment: VideoFrame[]): Promise<void> => {
+      if (!segment.length || aborted) return
       const start = segment[0]!.timestamp
       const end = Math.min(duration, (segment.at(-1)?.timestamp || start) + interval)
-      chunks.push({
+      const chunk: DecodedChunk = {
         modality: 'video',
         start,
         end,
-        input: { kind: 'video', frames: segment.map(({ data, width, height, timestamp }) => ({ data, width, height, timestamp })), duration: end - start },
-      })
+        input: {
+          kind: 'video',
+          frames: segment.map(({ data, width, height, timestamp }) => ({ data, width, height, timestamp })),
+          duration: end - start,
+        },
+      }
+      chunks.push(chunk)
+      await handlers?.onChunks?.([chunk])
     }
-    const poster = samples.find((sample) => sample.thumb)?.thumb
-    return { chunks, thumb: poster, duration, width: video.videoWidth, height: video.videoHeight }
+    const runLane = async (video: HTMLVideoElement, laneTimes: number[]): Promise<void> => {
+      try {
+        await metadataReady(video)
+        const scale = Math.min(1, 512 / Math.max(video.videoWidth, video.videoHeight))
+        const canvas = document.createElement('canvas')
+        canvas.width = Math.max(1, Math.round(video.videoWidth * scale))
+        canvas.height = Math.max(1, Math.round(video.videoHeight * scale))
+        const context = canvas.getContext('2d', { willReadFrequently: true })
+        if (!context) throw new Error('无法创建图像画布')
+        let frames: VideoFrame[] = []
+        for (const time of laneTimes) {
+          if (aborted) return
+          await seek(video, time)
+          context.drawImage(video, 0, 0, canvas.width, canvas.height)
+          frames.push({
+            data: context.getImageData(0, 0, canvas.width, canvas.height).data,
+            width: canvas.width,
+            height: canvas.height,
+            timestamp: time,
+          })
+          sampled += 1
+          handlers?.onProgress?.(sampled, times.length)
+          if (frames.length === framesPerSegment) {
+            await emitSegment(frames)
+            frames = []
+          }
+        }
+        await emitSegment(frames)
+      } finally {
+        releaseVideo(video)
+      }
+    }
+    const lanes = [probe]
+    probeInLane = true
+    for (let index = 1; index < laneCount; index += 1) lanes.push(videoElement(url))
+    const laneJobs = lanes.map((_, lane) => {
+      const firstSegment = lane * segmentsPerLane
+      return times.slice(
+        firstSegment * framesPerSegment,
+        Math.min(times.length, (firstSegment + segmentsPerLane) * framesPerSegment),
+      )
+    })
+    await Promise.all(lanes.map((video, index) =>
+      runLane(video, laneJobs[index]!).catch((error: unknown) => {
+        aborted = true
+        throw error
+      }),
+    ))
+    chunks.sort((left, right) => (left.start || 0) - (right.start || 0))
+    const posterChunk = chunks[Math.floor(chunks.length * 0.1)] ?? chunks[0]
+    const posterFrame = posterChunk?.input.kind === 'video' ? posterChunk.input.frames[0] : undefined
+    return {
+      chunks,
+      thumb: posterFrame ? await thumbFromFrame(posterFrame) : undefined,
+      duration,
+      width: probe.videoWidth,
+      height: probe.videoHeight,
+    }
   } finally {
-    video.removeAttribute('src')
-    video.load()
+    if (!probeInLane) releaseVideo(probe)
     if (ownsUrl) URL.revokeObjectURL(url)
   }
 }
@@ -203,9 +306,14 @@ async function decodePdf(blob: Blob): Promise<DecodedFile> {
   return { chunks, thumb: firstThumb, pagesThumbs, pages: pdfDocument.numPages }
 }
 
-export async function decodeMedia(source: MediaSource, filename: string, settings: Settings): Promise<DecodedFile> {
+export async function decodeMedia(
+  source: MediaSource,
+  filename: string,
+  settings: Settings,
+  handlers?: DecodeHandlers,
+): Promise<DecodedFile> {
   const ext = filename.split('.').at(-1)?.toLowerCase() || ''
-  if (VIDEO_EXTENSIONS.has(ext)) return decodeVideo(source, settings)
+  if (VIDEO_EXTENSIONS.has(ext)) return decodeVideo(source, settings, handlers)
   if (typeof source === 'string') throw new Error('该文件类型需要读取文件内容')
   if (IMAGE_EXTENSIONS.has(ext)) {
     const image = await imageData(source)

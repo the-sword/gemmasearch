@@ -1,5 +1,5 @@
 import type { FileEntry, FileRecord, Library, Modality } from '../host/types'
-import type { DecodedChunk } from '../media/decode'
+import type { DecodedChunk, DecodedFile, MediaSource } from '../media/decode'
 import { decodeMedia, modalityForExtension } from '../media/decode'
 import type { Settings } from '../settings'
 import { EngineClient } from '../engine/client'
@@ -16,6 +16,12 @@ export interface IndexProgress {
 }
 
 const SPEED_DELAY: Record<Settings['indexSpeed'], number> = { low: 200, mid: 50, high: 0 }
+const MAX_PENDING_VIDEO_SEGMENTS = 4
+const ABORT_MESSAGE = '请求已取消'
+
+function abortError(): DOMException {
+  return new DOMException(ABORT_MESSAGE, 'AbortError')
+}
 
 function fileKey(library: Library, entry: FileEntry): string {
   return `${library.id}:${entry.path}`
@@ -82,6 +88,74 @@ export class Indexer {
     while (this.paused && !this.stopped) await new Promise((resolve) => window.setTimeout(resolve, 150))
   }
 
+  /**
+   * Decodes a video while embedding each segment as soon as it is ready, so
+   * seeking and inference overlap instead of running back to back. Embeds run
+   * serially (one worker request at a time) while the decoder may run ahead by
+   * up to MAX_PENDING_VIDEO_SEGMENTS segments.
+   * Returns undefined when the scan was stopped mid-decode (partial vectors
+   * are kept, matching the previous stop semantics).
+   */
+  private async decodeAndEmbedVideo(
+    library: Library,
+    key: string,
+    entry: FileEntry,
+    source: MediaSource,
+    done: number,
+    total: number,
+  ): Promise<DecodedFile | undefined> {
+    let embedQueue: Promise<void> = Promise.resolve()
+    let pendingSegments = 0
+    let embedError: unknown
+    const enqueue = (chunk: DecodedChunk): void => {
+      pendingSegments += 1
+      embedQueue = embedQueue.then(async () => {
+        try {
+          if (this.stopped) return
+          await this.engine.embed(chunk.input, [toMetadata(library, key, chunk)])
+          this.emit({ done, total, file: entry.path, status: '正在写入索引' })
+        } catch (error) {
+          embedError ??= error
+        } finally {
+          pendingSegments -= 1
+        }
+      })
+    }
+    const throwIfFailed = (): void => {
+      if (embedError) throw embedError instanceof Error ? embedError : new Error(String(embedError))
+    }
+    let decoded: DecodedFile | undefined
+    try {
+      decoded = await decodeMedia(source, entry.name, this.settings, {
+        onProgress: (sampled, totalSamples) => this.emit({
+          done,
+          total,
+          file: entry.path,
+          status: `正在解码 ${Math.round((sampled / Math.max(1, totalSamples)) * 100)}%`,
+        }),
+        onChunks: async (chunks) => {
+          await this.waitWhilePaused()
+          if (this.stopped) throw abortError()
+          throwIfFailed()
+          while (pendingSegments >= MAX_PENDING_VIDEO_SEGMENTS && !this.stopped && !embedError) {
+            await new Promise((resolve) => window.setTimeout(resolve, 50))
+          }
+          if (this.stopped) throw abortError()
+          throwIfFailed()
+          chunks.forEach(enqueue)
+        },
+      })
+    } catch (error) {
+      await embedQueue
+      throwIfFailed()
+      if (this.stopped && error instanceof DOMException && error.name === 'AbortError') return undefined
+      throw error
+    }
+    await embedQueue
+    throwIfFailed()
+    return decoded
+  }
+
   async scan(library: Library, { retryErrors = true }: { retryErrors?: boolean } = {}): Promise<void> {
     this.stopped = false
     this.emit({ done: 0, total: 0, status: '正在扫描文件夹…' })
@@ -132,15 +206,20 @@ export class Indexer {
           const source = modality === 'video'
             ? await host.mediaUrl(library, entry)
             : await host.readFile(library, entry)
-          const decoded = await decodeMedia(source, entry.name, this.settings)
-          record.duration = decoded.duration
-          record.width = decoded.width
-          record.height = decoded.height
-          record.pages = decoded.pages
-          if (decoded.thumb || decoded.peaks || decoded.pagesThumbs) {
-            await saveThumb({ fileKey: key, jpeg: decoded.thumb, peaks: decoded.peaks, pages: decoded.pagesThumbs })
+          const decoded = modality === 'video'
+            ? await this.decodeAndEmbedVideo(library, key, entry, source, done, updates.length)
+            : await decodeMedia(source, entry.name, this.settings)
+          if (decoded) {
+            record.duration = decoded.duration
+            record.width = decoded.width
+            record.height = decoded.height
+            record.pages = decoded.pages
+            if (decoded.thumb || decoded.peaks || decoded.pagesThumbs) {
+              await saveThumb({ fileKey: key, jpeg: decoded.thumb, peaks: decoded.peaks, pages: decoded.pagesThumbs })
+            }
           }
-          for (let offset = 0; offset < decoded.chunks.length;) {
+          // Video chunks are already embedded during decoding; other modalities embed here.
+          for (let offset = 0; decoded && modality !== 'video' && offset < decoded.chunks.length;) {
             await this.waitWhilePaused()
             if (this.stopped) break
             const chunk = decoded.chunks[offset]!
