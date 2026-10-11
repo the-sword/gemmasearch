@@ -84,6 +84,7 @@ export class Indexer {
 
   async scan(library: Library, { retryErrors = true }: { retryErrors?: boolean } = {}): Promise<void> {
     this.stopped = false
+    this.emit({ done: 0, total: 0, status: '正在扫描文件夹…' })
     const entries: FileEntry[] = []
     for await (const entry of await host.listFiles(library)) entries.push(entry)
     const seen = new Set(entries.map((entry) => fileKey(library, entry)))

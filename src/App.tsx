@@ -76,6 +76,7 @@ function App() {
   const librariesRef = useRef(libraries)
   const queuedRescans = useRef(new Set<string>())
   const loadedSettings = useRef('')
+  const engineInit = useRef<{ signature: string; promise: Promise<EngineStatus> } | null>(null)
   const startupOnboardingComplete = useRef(false)
   const autoLoadStarted = useRef(false)
   const recorder = useRef<MediaRecorder | null>(null)
@@ -123,16 +124,31 @@ function App() {
     const client = engineRef.current ?? new EngineClient()
     engineRef.current = client
     const signature = JSON.stringify(settings)
+    const inFlight = engineInit.current
+    if (inFlight) {
+      if (inFlight.signature === signature) {
+        await inFlight.promise
+        setEngineError('')
+        return client
+      }
+      await inFlight.promise.catch(() => undefined)
+    }
     if (force || loadedSettings.current !== signature) {
       setBusy(true)
       setLoadProgress({ percent: 0, file: '' })
+      const promise = client.init(settings, (percent, file) => setLoadProgress({ percent, file: file || '' }))
+      const entry = { signature, promise }
+      engineInit.current = entry
       try {
-        const status = await client.init(settings, (percent, file) => setLoadProgress({ percent, file: file || '' }))
+        const status = await promise
         engineStatusRef.current = status
         setEngineStatus(status)
         loadedSettings.current = signature
       } finally {
-        setBusy(false)
+        if (engineInit.current === entry) {
+          engineInit.current = null
+          setBusy(false)
+        }
       }
     }
     setEngineError('')
@@ -168,6 +184,7 @@ function App() {
   const startIndexing = useCallback(async (library: Library, options: { retryErrors?: boolean } = {}) => {
     if (indexers.current.has(library.id)) {
       queuedRescans.current.add(library.id)
+      setToast('该资料库正在索引中，完成后会自动继续')
       return
     }
     try {
@@ -192,7 +209,9 @@ function App() {
       await refreshData()
       setToast('索引已更新')
     } catch (error) {
-      setToast(error instanceof Error ? error.message : '索引失败')
+      const message = error instanceof Error ? error.message : '索引失败'
+      setProgress((current) => ({ ...current, [library.id]: { done: 0, total: 0, status: `失败：${message}` } }))
+      setToast(message)
     }
   }, [ensureEngine, refreshData, settings])
 
@@ -616,8 +635,9 @@ function App() {
                 const doneCount = progressValue?.done ?? libraryFiles.length
                 const totalCount = progressValue?.total ?? libraryFiles.length
                 const mismatch = library.modelSig !== activeModelSignature
+                const failed = progressValue?.status.startsWith('失败') ?? false
                 const canRescan = library.kind !== 'imported' && (library.kind !== 'files' || hasSessionLibrary(library))
-                return <tr key={library.id}><td><div className="library-name"><span className="library-icon"><Icon name="folder" size={17} /></span><div><b>{displayLibraryName(library)}</b><small>{library.rootPath?.startsWith('session:') ? (hasSessionLibrary(library) ? '临时会话文件' : '原文件需重新添加') : library.rootPath || '导入的索引'}</small></div></div></td><td><span className="type-badge">{library.kind === 'folder' ? '文件夹' : library.kind === 'imported' ? '导入' : '文件'}</span></td><td>{libraryFiles.length}</td><td><div className="progress-cell"><div className="progress-track"><i style={{ width: `${totalCount ? Math.round(doneCount / totalCount * 100) : libraryFiles.length ? 100 : 0}%` }} /></div><span>{progressValue ? `${doneCount}/${totalCount}` : `${libraryFiles.filter((file) => file.status === 'ok').length} 已索引`}</span></div>{progressValue?.file && <small className="current-task">{progressValue.file}</small>}</td><td><span className={`state-badge ${mismatch ? 'warning' : progressValue ? 'working' : 'ready'}`}>{mismatch ? t('rebuild') : progressValue?.status || '就绪'}</span></td><td><div className="table-actions"><button title={progressValue?.status === '已暂停' ? t('resume') : t('pause')} disabled={!indexers.current.has(library.id)} onClick={() => progressValue?.status === '已暂停' ? indexers.current.get(library.id)?.resume() : indexers.current.get(library.id)?.pause()}>{progressValue?.status === '已暂停' ? '▶' : 'Ⅱ'}</button><button title={canRescan ? t('rescan') : '原文件需重新添加后才能扫描'} disabled={!canRescan} onClick={() => void startIndexing(library)}>↻</button><button title={t('export')} onClick={() => void beginExport(library)}>⇩</button><button title={t('remove')} onClick={() => void remove(library)}>×</button></div></td></tr>
+                return <tr key={library.id}><td><div className="library-name"><span className="library-icon"><Icon name="folder" size={17} /></span><div><b>{displayLibraryName(library)}</b><small>{library.rootPath?.startsWith('session:') ? (hasSessionLibrary(library) ? '临时会话文件' : '原文件需重新添加') : library.rootPath || '导入的索引'}</small></div></div></td><td><span className="type-badge">{library.kind === 'folder' ? '文件夹' : library.kind === 'imported' ? '导入' : '文件'}</span></td><td>{libraryFiles.length}</td><td><div className="progress-cell"><div className="progress-track"><i style={{ width: `${totalCount ? Math.round(doneCount / totalCount * 100) : libraryFiles.length ? 100 : 0}%` }} /></div><span>{progressValue ? `${doneCount}/${totalCount}` : `${libraryFiles.filter((file) => file.status === 'ok').length} 已索引`}</span></div>{progressValue?.file && <small className="current-task">{progressValue.file}</small>}</td><td><span className={`state-badge ${mismatch || failed ? 'warning' : progressValue ? 'working' : 'ready'}`}>{mismatch ? t('rebuild') : progressValue?.status || '就绪'}</span></td><td><div className="table-actions"><button title={progressValue?.status === '已暂停' ? t('resume') : t('pause')} disabled={!indexers.current.has(library.id)} onClick={() => progressValue?.status === '已暂停' ? indexers.current.get(library.id)?.resume() : indexers.current.get(library.id)?.pause()}>{progressValue?.status === '已暂停' ? '▶' : 'Ⅱ'}</button><button title={canRescan ? t('rescan') : '原文件需重新添加后才能扫描'} disabled={!canRescan} onClick={() => void startIndexing(library)}>↻</button><button title={t('export')} onClick={() => void beginExport(library)}>⇩</button><button title={t('remove')} onClick={() => void remove(library)}>×</button></div></td></tr>
               })}
               {!libraries.length && <tr><td className="table-empty" colSpan={6}>还没有索引库。添加文件或导入 .gsidx 索引包开始。</td></tr>}
             </tbody></table></div>

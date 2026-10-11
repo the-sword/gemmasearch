@@ -4,10 +4,12 @@ import type { FileEntry } from '../src/host/types.js'
 
 const IGNORED_FILES = new Set(['desktop.ini', 'thumbs.db', 'ehthumbs.db'])
 
+const IGNORED_DIRS = new Set(['node_modules', '__pycache__', 'venv', 'target', 'dist', 'build', 'coverage', 'out'])
+
 export function isIgnoredName(name: string): boolean {
   const normalized = name.toLowerCase()
   return name.startsWith('.') ||
-    normalized === 'node_modules' ||
+    IGNORED_DIRS.has(normalized) ||
     name.startsWith('$') ||
     normalized === 'system volume information' ||
     IGNORED_FILES.has(normalized)
