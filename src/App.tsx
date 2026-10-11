@@ -45,6 +45,8 @@ function App() {
   const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null)
   const [loadProgress, setLoadProgress] = useState({ percent: 0, file: '' })
   const [busy, setBusy] = useState(false)
+  const [engineError, setEngineError] = useState('')
+  const [startupReady, setStartupReady] = useState(false)
   const [toast, setToast] = useState('')
   const [progress, setProgress] = useState<Record<string, IndexProgress>>({})
   const [query, setQuery] = useState('')
@@ -74,6 +76,8 @@ function App() {
   const librariesRef = useRef(libraries)
   const queuedRescans = useRef(new Set<string>())
   const loadedSettings = useRef('')
+  const startupOnboardingComplete = useRef(false)
+  const autoLoadStarted = useRef(false)
   const recorder = useRef<MediaRecorder | null>(null)
   const t = (key: Parameters<typeof translate>[1]) => translate(settings, key)
   const activeDtype = engineStatus?.actualDtype ?? WEIGHT_PROFILES[settings.weights]
@@ -103,7 +107,9 @@ function App() {
       refreshData(),
     ]).then(([savedSettings, onboardingComplete]) => {
       if (savedSettings) setSettings(normalizeSettings(savedSettings))
+      startupOnboardingComplete.current = Boolean(onboardingComplete)
       if (onboardingComplete) setPage('search')
+      setStartupReady(true)
     })
   }, [refreshData])
 
@@ -129,8 +135,26 @@ function App() {
         setBusy(false)
       }
     }
+    setEngineError('')
     return client
   }, [settings])
+
+  const loadEngine = useCallback(async () => {
+    setEngineError('')
+    try {
+      await ensureEngine(true)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '模型加载失败'
+      setEngineError(message)
+      setToast(message)
+    }
+  }, [ensureEngine])
+
+  useEffect(() => {
+    if (!startupReady || !startupOnboardingComplete.current || autoLoadStarted.current) return
+    autoLoadStarted.current = true
+    void loadEngine()
+  }, [startupReady, loadEngine])
 
   const updateSettings = (patch: Partial<Settings>) => {
     const nextSettings = { ...settings, ...patch }
@@ -478,7 +502,14 @@ function App() {
           <input ref={fileInput} hidden type="file" multiple onChange={(event) => { const selected = Array.from(event.target.files || []); event.currentTarget.value = ''; void addFiles(selected) }} />
         </div>
         <div className="status-footer">
-          <div className="status-row"><span className={`status-dot ${engineStatus ? 'ready' : ''}`} />{engineStatus ? `${engineStatus.backend.toUpperCase()} · ${activeProfile}` : '模型未加载'}</div>
+          <div className="status-row">
+            <span className={`status-dot ${engineStatus ? 'ready' : ''}`} />
+            {busy
+              ? `加载模型 ${loadProgress.percent}%`
+              : engineStatus
+                ? `${engineStatus.backend.toUpperCase()} · ${activeProfile}`
+                : <button className="button text small" disabled={busy} title={engineError || undefined} onClick={() => void loadEngine()}>{engineError ? '加载失败，重试' : '加载模型'}</button>}
+          </div>
           {busy && <div className="mini-progress"><i style={{ width: `${loadProgress.percent}%` }} /></div>}
           {engineStatus && <div className="status-caption">{engineStatus.actualDtype.model} · {engineStatus.actualDtype.vision_encoder} · {engineStatus.actualDtype.audio_encoder}</div>}
           {Object.entries(progress).filter(([, item]) => item.total > 0).slice(0, 1).map(([id, item]) => <div className="status-caption" key={id}>索引中 {item.done}/{item.total}</div>)}
@@ -515,7 +546,11 @@ function App() {
                   void saveSetting('onboardingComplete', true)
                   setPage('search')
                   setToast('模型已就绪，可添加文件')
-                }).catch((error: unknown) => setToast(error instanceof Error ? error.message : '模型加载失败'))
+                }).catch((error: unknown) => {
+                  const message = error instanceof Error ? error.message : '模型加载失败'
+                  setEngineError(message)
+                  setToast(message)
+                })
               }}>{busy ? `${t('modelDownload')} ${loadProgress.percent}%` : '加载模型并开始'}<span>→</span></button>
               <div className="welcome-details"><span className={`gpu-pill ${navigator.gpu ? 'available' : ''}`}>◈ {navigator.gpu ? 'WebGPU 可用' : '将使用 WASM CPU'}</span><span>默认 256 维</span></div>
               {busy && <div className="load-track"><i style={{ width: `${loadProgress.percent}%` }} /></div>}
@@ -610,7 +645,7 @@ function App() {
               <div className="setting-section"><h2>索引性能</h2><SettingRow title="视频片段" hint="视频按时间段抽帧并分别编码。"><select value={settings.videoSegmentSec} onChange={(event) => updateSettings({ videoSegmentSec: Number(event.target.value) as Settings['videoSegmentSec'] })}><option value={8}>8 秒</option><option value={16}>16 秒</option></select></SettingRow><SettingRow title="音频片段" hint="长音频拆分为连续片段。"><select value={settings.audioSegmentSec} onChange={(event) => updateSettings({ audioSegmentSec: Number(event.target.value) as Settings['audioSegmentSec'] })}><option value={30}>30 秒</option><option value={60}>60 秒</option></select></SettingRow><SettingRow title="索引速度" hint="低速会在批次间增加间隔。"><select value={settings.indexSpeed} onChange={(event) => updateSettings({ indexSpeed: event.target.value as Settings['indexSpeed'] })}><option value="low">低 · 200 ms</option><option value="mid">中 · 50 ms</option><option value="high">高 · 无间隔</option></select></SettingRow></div>
               <div className="setting-section"><h2>界面与网络</h2><SettingRow title="模型来源" hint="自动优先 Hugging Face，连接失败时回退到镜像。"><select value={settings.modelHost} onChange={(event) => updateSettings({ modelHost: event.target.value as Settings['modelHost'] })}><option value="auto">自动（优先 Hugging Face，连不上时用镜像）</option><option value="mirror">HF Mirror（hf-mirror.com）</option></select></SettingRow><SettingRow title={t('language')}><select value={settings.lang} onChange={(event) => updateSettings({ lang: event.target.value as Settings['lang'] })}><option value="zh">简体中文</option><option value="en">English</option></select></SettingRow></div>
             </div><aside className="settings-aside">
-              <div className="panel backend-panel"><div className="panel-header"><h3>运行状态</h3><span className={`state-badge ${engineStatus ? 'ready' : ''}`}>{engineStatus ? `${engineStatus.backend} · ${engineStatus.profile}` : '未加载'}</span></div><dl><dt>设备</dt><dd>{engineStatus?.adapter || (engineStatus?.backend === 'wasm' ? 'CPU' : '—')}</dd><dt>模型来源</dt><dd>{engineStatus?.modelHost || '—'}</dd><dt>模型精度</dt><dd>{activeDtype.model}</dd><dt>模型加载</dt><dd>{engineStatus ? `${(engineStatus.loadMs / 1000).toFixed(1)} 秒` : '待启动'}</dd></dl>{engineStatus?.fallbackReason && <p className="fallback-note">{engineStatus.fallbackReason}</p>}</div>
+              <div className="panel backend-panel"><div className="panel-header"><h3>运行状态</h3><span className={`state-badge ${engineStatus ? 'ready' : ''}`}>{engineStatus ? `${engineStatus.backend} · ${engineStatus.profile}` : '未加载'}</span></div><dl><dt>设备</dt><dd>{engineStatus?.adapter || (engineStatus?.backend === 'wasm' ? 'CPU' : '—')}</dd><dt>模型来源</dt><dd>{engineStatus?.modelHost || '—'}</dd><dt>模型精度</dt><dd>{activeDtype.model}</dd><dt>模型加载</dt><dd>{engineStatus ? `${(engineStatus.loadMs / 1000).toFixed(1)} 秒` : '待启动'}</dd></dl>{engineStatus?.fallbackReason && <p className="fallback-note">{engineStatus.fallbackReason}</p>}{engineError && <p className="fallback-note">{engineError}</p>}<button className="button secondary small" disabled={busy} onClick={() => void loadEngine()}>重新加载模型</button></div>
               <div className="panel cache-panel"><span className="cache-icon">⌁</span><h3>模型缓存</h3><p>已下载的模型会保存在此浏览器中，清理后下次使用需要重新下载。</p><button className="button secondary full" onClick={async () => { await caches.delete('transformers-cache'); setToast('模型缓存已清理') }}>清理模型缓存</button></div>
               <div className="privacy-card"><b>隐私设计</b><p>文本、媒体和索引向量均在浏览器中处理。联网仅用于首次获取模型文件。</p></div>
             </aside></div>
