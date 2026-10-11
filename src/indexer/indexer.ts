@@ -6,6 +6,7 @@ import { EngineClient } from '../engine/client'
 import type { PersistMeta } from '../engine/protocol'
 import { getFiles, getFile, getThumb, saveFile, saveThumb } from '../engine/store'
 import { host } from '../host'
+import { shouldReindexFile } from './retry'
 
 export interface IndexProgress {
   done: number
@@ -81,7 +82,7 @@ export class Indexer {
     while (this.paused && !this.stopped) await new Promise((resolve) => window.setTimeout(resolve, 150))
   }
 
-  async scan(library: Library): Promise<void> {
+  async scan(library: Library, { retryErrors = true }: { retryErrors?: boolean } = {}): Promise<void> {
     this.stopped = false
     const entries: FileEntry[] = []
     for await (const entry of await host.listFiles(library)) entries.push(entry)
@@ -98,7 +99,7 @@ export class Indexer {
       const retryEnabledModality = previous?.status === 'skipped' &&
         previous.reason === '该模态未启用' &&
         isEnabled(modality, this.settings)
-      if (!previous || previous.status === 'error' || retryEnabledModality || previous.size !== entry.size || previous.mtime !== entry.mtime) updates.push(entry)
+      if (shouldReindexFile(previous, entry, retryErrors, retryEnabledModality)) updates.push(entry)
     }
     let done = 0
     this.emit({ done, total: updates.length, status: '准备索引' })

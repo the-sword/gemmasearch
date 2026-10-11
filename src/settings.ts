@@ -2,6 +2,8 @@ export type Dtype = 'fp16' | 'q8' | 'q4' | 'q4f16'
 export type DtypeProfile = { model: Dtype; vision_encoder: Dtype; audio_encoder: Dtype }
 export type WeightProfile = 'standard' | 'gpu-lite'
 export type EffectiveBackend = 'webgpu' | 'wasm'
+export type ModelHostSetting = 'auto' | 'mirror'
+export type ResolvedModelHost = 'huggingface.co' | 'hf-mirror.com'
 
 export interface Settings {
   backend: 'auto' | 'wasm'
@@ -11,7 +13,7 @@ export interface Settings {
   visionTokens: 70 | 140 | 280 | 560 | 1120
   videoSegmentSec: 8 | 16
   audioSegmentSec: 30 | 60
-  modelHost: 'hf' | 'mirror'
+  modelHost: ModelHostSetting
   indexSpeed: 'low' | 'mid' | 'high'
   lang: 'zh' | 'en'
 }
@@ -24,7 +26,7 @@ export const DEFAULT_SETTINGS: Settings = {
   visionTokens: 280,
   videoSegmentSec: 16,
   audioSegmentSec: 30,
-  modelHost: 'hf',
+  modelHost: 'auto',
   indexSpeed: 'mid',
   lang: 'zh',
 }
@@ -49,11 +51,13 @@ export function normalizeSettings(value: unknown): Settings {
     : normalized.weights === 'gpu-lite'
       ? 'gpu-lite'
       : 'standard'
+  const modelHost: ModelHostSetting = normalized.modelHost === 'mirror' ? 'mirror' : 'auto'
 
   return {
     ...DEFAULT_SETTINGS,
     ...normalized,
     weights,
+    modelHost,
     modalities: {
       ...DEFAULT_SETTINGS.modalities,
       ...(normalized.modalities && typeof normalized.modalities === 'object'
@@ -61,6 +65,44 @@ export function normalizeSettings(value: unknown): Settings {
         : {}),
     },
   } as Settings
+}
+
+const HF_MODEL_CONFIG_URL = 'https://huggingface.co/onnx-community/embeddinggemma-2-ONNX/resolve/main/config.json'
+const MIRROR_MODEL_CONFIG_URL = 'https://hf-mirror.com/onnx-community/embeddinggemma-2-ONNX/resolve/main/config.json'
+
+async function hasCachedModelFile(url: string): Promise<boolean> {
+  try {
+    return Boolean(await (await caches.open('transformers-cache')).match(url))
+  } catch {
+    return false
+  }
+}
+
+export async function resolveModelHost(
+  modelHost: ModelHostSetting,
+  fetchFn: typeof fetch = fetch,
+  hasCached: (url: string) => Promise<boolean> = hasCachedModelFile,
+): Promise<ResolvedModelHost> {
+  if (modelHost === 'mirror') return 'hf-mirror.com'
+  for (const [url, host] of [
+    [HF_MODEL_CONFIG_URL, 'huggingface.co'],
+    [MIRROR_MODEL_CONFIG_URL, 'hf-mirror.com'],
+  ] as const) {
+    try {
+      if (await hasCached(url)) return host
+    } catch {
+      // Cache access can fail in private or restricted browsing contexts.
+    }
+  }
+  try {
+    const response = await fetchFn(
+      HF_MODEL_CONFIG_URL,
+      { method: 'GET', cache: 'no-store', signal: AbortSignal.timeout(6000) },
+    )
+    return response.ok ? 'huggingface.co' : 'hf-mirror.com'
+  } catch {
+    return 'hf-mirror.com'
+  }
 }
 
 export function modelSignature(

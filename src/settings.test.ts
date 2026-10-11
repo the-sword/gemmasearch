@@ -1,10 +1,11 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   DEFAULT_SETTINGS,
   estimateModelDownloadMB,
   modelSignature,
   normalizeSettings,
   planEngine,
+  resolveModelHost,
   WEIGHT_PROFILES,
   type Settings,
 } from './settings'
@@ -16,6 +17,7 @@ describe('unified model weight settings', () => {
       'gpu-lite': { model: 'q4', vision_encoder: 'q4', audio_encoder: 'q8' },
     })
     expect(DEFAULT_SETTINGS.weights).toBe('standard')
+    expect(DEFAULT_SETTINGS.modelHost).toBe('auto')
   })
 
   it.each([
@@ -95,5 +97,73 @@ describe('unified model weight settings', () => {
     expect(estimateModelDownloadMB('gpu-lite', { vision: false, audio: true })).toBe(514.8)
     expect(estimateModelDownloadMB('standard', { vision: true, audio: false })).toBe(878.1)
     expect(estimateModelDownloadMB('gpu-lite', { vision: true, audio: false })).toBe(283.7)
+  })
+
+  it.each([
+    [{ modelHost: 'hf' }, 'auto'],
+    [{}, 'auto'],
+    [{ modelHost: 'mirror' }, 'mirror'],
+  ] as const)('migrates model host setting %o to %s', (saved, expected) => {
+    expect(normalizeSettings(saved).modelHost).toBe(expected)
+  })
+
+  it('uses Hugging Face when its model config probe succeeds', async () => {
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue({ ok: true } as Response)
+    const hasCached = vi.fn(async () => false)
+
+    await expect(resolveModelHost('auto', fetchFn, hasCached)).resolves.toBe('huggingface.co')
+    expect(fetchFn).toHaveBeenCalledWith(
+      'https://huggingface.co/onnx-community/embeddinggemma-2-ONNX/resolve/main/config.json',
+      expect.objectContaining({ method: 'GET', cache: 'no-store' }),
+    )
+    expect(fetchFn.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal)
+    expect(hasCached).toHaveBeenCalledWith(
+      'https://huggingface.co/onnx-community/embeddinggemma-2-ONNX/resolve/main/config.json',
+    )
+    expect(hasCached).toHaveBeenCalledWith(
+      'https://hf-mirror.com/onnx-community/embeddinggemma-2-ONNX/resolve/main/config.json',
+    )
+  })
+
+  it('falls back to the mirror on a non-ok response or a failed probe', async () => {
+    await expect(
+      resolveModelHost(
+        'auto',
+        vi.fn<typeof fetch>().mockResolvedValue({ ok: false } as Response),
+        async () => false,
+      ),
+    ).resolves.toBe('hf-mirror.com')
+    await expect(
+      resolveModelHost(
+        'auto',
+        vi.fn<typeof fetch>().mockRejectedValue(new DOMException('timeout', 'TimeoutError')),
+        async () => false,
+      ),
+    ).resolves.toBe('hf-mirror.com')
+    await expect(
+      resolveModelHost('auto', vi.fn<typeof fetch>().mockResolvedValue({ ok: true } as Response), async () => {
+        throw new Error('cache unavailable')
+      }),
+    ).resolves.toBe('huggingface.co')
+  })
+
+  it.each([
+    ['https://huggingface.co/onnx-community/embeddinggemma-2-ONNX/resolve/main/config.json', 'huggingface.co'],
+    ['https://hf-mirror.com/onnx-community/embeddinggemma-2-ONNX/resolve/main/config.json', 'hf-mirror.com'],
+  ] as const)('uses cached model metadata from %s without a network probe', async (cachedUrl, expectedHost) => {
+    const fetchFn = vi.fn<typeof fetch>()
+    const hasCached = vi.fn(async (url: string) => url === cachedUrl)
+
+    await expect(resolveModelHost('auto', fetchFn, hasCached)).resolves.toBe(expectedHost)
+    expect(fetchFn).not.toHaveBeenCalled()
+  })
+
+  it('does not probe Hugging Face when the mirror is selected', async () => {
+    const fetchFn = vi.fn<typeof fetch>()
+    const hasCached = vi.fn(async () => false)
+
+    await expect(resolveModelHost('mirror', fetchFn, hasCached)).resolves.toBe('hf-mirror.com')
+    expect(fetchFn).not.toHaveBeenCalled()
+    expect(hasCached).not.toHaveBeenCalled()
   })
 })

@@ -1,5 +1,5 @@
 import type { Modality, SearchItem, VideoMode } from '../host/types'
-import type { DtypeProfile, Settings, WeightProfile } from '../settings'
+import type { DtypeProfile, ResolvedModelHost, Settings, WeightProfile } from '../settings'
 
 export type ImageInput = { data: Uint8ClampedArray; width: number; height: number }
 
@@ -57,6 +57,7 @@ export type WorkerResponse =
 export interface EngineStatus {
   backend: 'webgpu' | 'wasm'
   profile: WeightProfile
+  modelHost: ResolvedModelHost
   adapter?: string
   shaderF16: boolean
   fallbackReason?: string

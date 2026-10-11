@@ -13,6 +13,7 @@ import type { SearchItem, Modality, VideoMode } from '../host/types'
 import {
   modelSignature,
   planEngine,
+  resolveModelHost,
   WEIGHT_PROFILES,
   type DtypeProfile,
   type EffectiveBackend,
@@ -36,9 +37,14 @@ const activeRequests = new Set<number>()
 const cancelledRequests = new Set<number>()
 let videoTokenBudgetLogged = false
 
-function disposeModel(): void {
-  (model as unknown as { dispose?: () => void } | undefined)?.dispose?.()
-  model = undefined
+async function disposeModel(): Promise<void> {
+  try {
+    await (model as unknown as { dispose?: () => void | Promise<void> } | undefined)?.dispose?.()
+  } catch (error) {
+    console.warn('[GemmaSearch] model disposal failed', error)
+  } finally {
+    model = undefined
+  }
 }
 
 function toArrayBuffer(values: Uint16Array): ArrayBuffer {
@@ -183,14 +189,15 @@ async function loadBackend(
 
 async function init(settings: Settings, id: number, splitAudioWasm: boolean): Promise<EngineStatus> {
   checkCancelled(id)
-  disposeModel()
+  await disposeModel()
   processor = undefined
   currentSettings = settings
   currentModelSignature = undefined
   videoTokenBudgetLogged = false
   vectorItems = undefined
   vectorMatrix = undefined
-  env.remoteHost = settings.modelHost === 'mirror' ? 'https://hf-mirror.com/' : 'https://huggingface.co/'
+  const modelHost = await resolveModelHost(settings.modelHost)
+  env.remoteHost = `https://${modelHost}/`
   const wasmEnvironment = env.backends.onnx.wasm
   if (!wasmEnvironment) throw new Error('当前 transformers.js 未提供 WASM 后端')
   wasmEnvironment.wasmPaths = `${workerScope.location.origin}/ort/`
@@ -238,6 +245,7 @@ async function init(settings: Settings, id: number, splitAudioWasm: boolean): Pr
       return {
         backend: 'webgpu',
         profile: plan.profile,
+        modelHost,
         adapter: adapterName,
         shaderF16,
         loadMs: performance.now() - started,
@@ -247,7 +255,7 @@ async function init(settings: Settings, id: number, splitAudioWasm: boolean): Pr
       if (error instanceof DOMException && error.name === 'AbortError') throw error
       const detail = error instanceof Error ? error.message : String(error)
       fallbackReason = `WebGPU 初始化失败：${detail}；已改用 CPU 标准权重`
-      disposeModel()
+      await disposeModel()
       processor = undefined
       plan = { device: 'wasm', profile: 'standard' }
     }
@@ -269,6 +277,7 @@ async function init(settings: Settings, id: number, splitAudioWasm: boolean): Pr
   return {
     backend: 'wasm',
     profile: plan.profile,
+    modelHost,
     adapter: adapterName,
     shaderF16,
     fallbackReason,

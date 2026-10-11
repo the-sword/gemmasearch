@@ -8,7 +8,7 @@ import type { FileRecord, Library, Modality, SearchItem, ThumbnailRecord } from 
 import { createFilesLibrary, forgetSessionLibrary, hasSessionLibrary } from './host/web'
 import { Indexer, type IndexProgress } from './indexer/indexer'
 import { translate } from './i18n'
-import { decodeAudio, decodeMedia } from './media/decode'
+import { decodeAudio, decodeMedia, modalityForExtension } from './media/decode'
 import {
   DEFAULT_SETTINGS,
   estimateModelDownloadMB,
@@ -26,6 +26,10 @@ type EnrichedHit = SearchHit & { file?: FileRecord; thumb?: ThumbnailRecord }
 const MODALITIES: Modality[] = ['image', 'video', 'audio', 'pdf', 'text']
 function fileExtension(path: string): string {
   return path.split('.').at(-1)?.toUpperCase() || 'FILE'
+}
+
+function displayLibraryName(library: Library): string {
+  return library.name || library.rootPath || '未命名'
 }
 
 function formatTime(value?: number): string {
@@ -61,8 +65,13 @@ function App() {
   const engineRef = useRef<EngineClient | null>(null)
   const engineStatusRef = useRef<EngineStatus | null>(null)
   const indexers = useRef(new Map<string, Indexer>())
-  const watchers = useRef(new Map<string, () => void>())
+  const watchers = useRef(new Map<string, { rootPath: string; stop: () => void }>())
   const watchTimers = useRef(new Map<string, number>())
+  const registeredRoots = useRef<{ signature: string; promise: Promise<void | undefined> }>({
+    signature: '',
+    promise: Promise.resolve(),
+  })
+  const librariesRef = useRef(libraries)
   const queuedRescans = useRef(new Set<string>())
   const loadedSettings = useRef('')
   const recorder = useRef<MediaRecorder | null>(null)
@@ -132,7 +141,7 @@ function App() {
     void saveSetting('settings', nextSettings)
   }
 
-  const startIndexing = useCallback(async (library: Library) => {
+  const startIndexing = useCallback(async (library: Library, options: { retryErrors?: boolean } = {}) => {
     if (indexers.current.has(library.id)) {
       queuedRescans.current.add(library.id)
       return
@@ -149,7 +158,7 @@ function App() {
       indexers.current.set(library.id, indexer)
       indexer.onProgress((value) => setProgress((current) => ({ ...current, [library.id]: value })))
       try {
-        await indexer.scan(updatedLibrary)
+        await indexer.scan(updatedLibrary, options)
       } finally {
         indexers.current.delete(library.id)
         if (queuedRescans.current.delete(library.id)) {
@@ -162,6 +171,16 @@ function App() {
       setToast(error instanceof Error ? error.message : '索引失败')
     }
   }, [ensureEngine, refreshData, settings])
+
+  const startIndexingRef = useRef(startIndexing)
+
+  useEffect(() => {
+    startIndexingRef.current = startIndexing
+  }, [startIndexing])
+
+  useEffect(() => {
+    librariesRef.current = libraries
+  }, [libraries])
 
   const addFiles = async (selected: File[]) => {
     if (!selected.length) return
@@ -198,35 +217,58 @@ function App() {
     const folderLibraries = libraries.filter((library) => library.kind === 'folder' && library.rootPath)
     let disposed = false
     void (async () => {
+      for (const [libraryId, registration] of watchers.current) {
+        const library = folderLibraries.find((candidate) => candidate.id === libraryId)
+        if (library && library.rootPath === registration.rootPath) continue
+        registration.stop()
+        watchers.current.delete(libraryId)
+        const timer = watchTimers.current.get(libraryId)
+        if (timer !== undefined) window.clearTimeout(timer)
+        watchTimers.current.delete(libraryId)
+      }
+      const roots = folderLibraries.map((library) => library.rootPath!).sort()
+      const rootsSignature = JSON.stringify(roots)
       try {
-        await host.registerRoots?.(folderLibraries.map((library) => library.rootPath!))
+        if (registeredRoots.current.signature !== rootsSignature) {
+          const promise = Promise.resolve(host.registerRoots?.(roots))
+          registeredRoots.current = { signature: rootsSignature, promise }
+        }
+        await registeredRoots.current.promise
       } catch (error) {
+        if (registeredRoots.current.signature === rootsSignature) {
+          registeredRoots.current = { signature: '', promise: Promise.resolve() }
+        }
         if (!disposed) setToast(error instanceof Error ? error.message : '无法注册文件夹')
         return
       }
       if (disposed || !host.watch) return
       for (const library of folderLibraries) {
         if (disposed) break
-        const stop = host.watch(library, () => {
+        const existing = watchers.current.get(library.id)
+        if (existing?.rootPath === library.rootPath) continue
+        const stop = host.watch(library, (event) => {
+          if (event.type !== 'unlink' && !modalityForExtension(event.path.split('.').at(-1)?.toLowerCase() || '')) return
           const previousTimer = watchTimers.current.get(library.id)
           if (previousTimer !== undefined) window.clearTimeout(previousTimer)
           const timer = window.setTimeout(() => {
             watchTimers.current.delete(library.id)
-            void startIndexing(library)
+            const currentLibrary = librariesRef.current.find((item) => item.id === library.id) || library
+            void startIndexingRef.current(currentLibrary, { retryErrors: false })
           }, 350)
           watchTimers.current.set(library.id, timer)
         })
-        watchers.current.set(library.id, stop)
+        watchers.current.set(library.id, { rootPath: library.rootPath!, stop })
       }
     })()
-    return () => {
-      disposed = true
-      for (const stop of watchers.current.values()) stop()
-      watchers.current.clear()
-      for (const timer of watchTimers.current.values()) window.clearTimeout(timer)
-      watchTimers.current.clear()
-    }
-  }, [libraries, startIndexing])
+    return () => { disposed = true }
+  }, [libraries])
+
+  useEffect(() => () => {
+    for (const registration of watchers.current.values()) registration.stop()
+    watchers.current.clear()
+    for (const timer of watchTimers.current.values()) window.clearTimeout(timer)
+    watchTimers.current.clear()
+  }, [])
 
   const runSearch = async (event?: FormEvent, similarItemId?: number) => {
     event?.preventDefault()
@@ -354,7 +396,8 @@ function App() {
       )
       await engineRef.current?.refresh()
       await refreshData()
-      setToast(mismatch ? `${library.name}：${t('rebuild')}` : `已导入 ${library.name}`)
+      const name = displayLibraryName(library)
+      setToast(mismatch ? `${name}：${t('rebuild')}` : `已导入 ${name}`)
       setPage('libraries')
     } catch (error) {
       setToast(error instanceof Error ? error.message : '导入失败')
@@ -364,7 +407,7 @@ function App() {
   }
 
   const remove = async (library: Library) => {
-    if (!window.confirm(`确定移除“${library.name}”？`)) return
+    if (!window.confirm(`确定移除“${displayLibraryName(library)}”？`)) return
     if (engineRef.current) await engineRef.current.removeLibrary(library.id)
     else await removeLibrary(library.id)
     forgetSessionLibrary(library)
@@ -378,7 +421,7 @@ function App() {
       const url = URL.createObjectURL(blob)
       const anchor = document.createElement('a')
       anchor.href = url
-      anchor.download = `${library.name}.gsidx`
+      anchor.download = `${displayLibraryName(library).replace(/[:\\]/g, '_')}.gsidx`
       anchor.click()
       URL.revokeObjectURL(url)
       setToast('索引包已导出')
@@ -425,7 +468,7 @@ function App() {
           <div className="section-title"><span>{t('librariesTitle')}</span><button className="icon-button" title={t('addFolder')} onClick={() => void addFolder()}>＋</button></div>
           {libraries.length === 0 ? <p className="sidebar-empty">还没有索引库</p> : libraries.map((library) => (
             <button key={library.id} className={`library-item ${selectedLibraries.includes(library.id) ? 'selected' : ''}`} onClick={() => setSelectedLibraries((current) => current.includes(library.id) ? current.filter((id) => id !== library.id) : [...current, library.id])}>
-              <Icon name="folder" size={15} /><span>{library.name}</span><small>{files.filter((file) => file.libId === library.id && file.status === 'ok').length}</small>
+              <Icon name="folder" size={15} /><span>{displayLibraryName(library)}</span><small>{files.filter((file) => file.libId === library.id && file.status === 'ok').length}</small>
             </button>
           ))}
         </section>
@@ -501,7 +544,7 @@ function App() {
               <div className="filter-chips"><button className={selectedModalities.length === 0 ? 'chip active' : 'chip'} onClick={() => setSelectedModalities([])}>{t('all')}<small>{files.filter((file) => file.status === 'ok').length}</small></button>
                 {countByModality.map(({ modality, count }) => <button key={modality} className={selectedModalities.includes(modality) ? 'chip active' : 'chip'} onClick={() => setSelectedModalities((current) => current.includes(modality) ? current.filter((item) => item !== modality) : [...current, modality])}>{t(modality)}<small>{count}</small></button>)}</div>
               <div className="result-tools">
-                <label className="select-with-label"><span>资料库</span><select value={selectedLibraries.length === 1 ? selectedLibraries[0] : 'all'} onChange={(event) => setSelectedLibraries(event.target.value === 'all' ? [] : [event.target.value])}><option value="all">全部资料库</option>{libraries.map((library) => <option key={library.id} value={library.id}>{library.name}</option>)}</select></label>
+                <label className="select-with-label"><span>资料库</span><select value={selectedLibraries.length === 1 ? selectedLibraries[0] : 'all'} onChange={(event) => setSelectedLibraries(event.target.value === 'all' ? [] : [event.target.value])}><option value="all">全部资料库</option>{libraries.map((library) => <option key={library.id} value={library.id}>{displayLibraryName(library)}</option>)}</select></label>
                 <label className="threshold-control" title={t('threshold')}>阈值 <input type="range" min="0" max="0.8" step="0.05" value={threshold} onChange={(event) => setThreshold(Number(event.target.value))} /><span>{Math.round(threshold * 100)}%</span></label>
                 <div className="view-toggle"><button className={!listMode ? 'active' : ''} title={t('grid')} onClick={() => setListMode(false)}>▦</button><button className={listMode ? 'active' : ''} title={t('list')} onClick={() => setListMode(true)}>☷</button></div>
               </div>
@@ -539,7 +582,7 @@ function App() {
                 const totalCount = progressValue?.total ?? libraryFiles.length
                 const mismatch = library.modelSig !== activeModelSignature
                 const canRescan = library.kind !== 'imported' && (library.kind !== 'files' || hasSessionLibrary(library))
-                return <tr key={library.id}><td><div className="library-name"><span className="library-icon"><Icon name="folder" size={17} /></span><div><b>{library.name}</b><small>{library.rootPath?.startsWith('session:') ? (hasSessionLibrary(library) ? '临时会话文件' : '原文件需重新添加') : library.rootPath || '导入的索引'}</small></div></div></td><td><span className="type-badge">{library.kind === 'folder' ? '文件夹' : library.kind === 'imported' ? '导入' : '文件'}</span></td><td>{libraryFiles.length}</td><td><div className="progress-cell"><div className="progress-track"><i style={{ width: `${totalCount ? Math.round(doneCount / totalCount * 100) : libraryFiles.length ? 100 : 0}%` }} /></div><span>{progressValue ? `${doneCount}/${totalCount}` : `${libraryFiles.filter((file) => file.status === 'ok').length} 已索引`}</span></div>{progressValue?.file && <small className="current-task">{progressValue.file}</small>}</td><td><span className={`state-badge ${mismatch ? 'warning' : progressValue ? 'working' : 'ready'}`}>{mismatch ? t('rebuild') : progressValue?.status || '就绪'}</span></td><td><div className="table-actions"><button title={progressValue?.status === '已暂停' ? t('resume') : t('pause')} disabled={!indexers.current.has(library.id)} onClick={() => progressValue?.status === '已暂停' ? indexers.current.get(library.id)?.resume() : indexers.current.get(library.id)?.pause()}>{progressValue?.status === '已暂停' ? '▶' : 'Ⅱ'}</button><button title={canRescan ? t('rescan') : '原文件需重新添加后才能扫描'} disabled={!canRescan} onClick={() => void startIndexing(library)}>↻</button><button title={t('export')} onClick={() => void beginExport(library)}>⇩</button><button title={t('remove')} onClick={() => void remove(library)}>×</button></div></td></tr>
+                return <tr key={library.id}><td><div className="library-name"><span className="library-icon"><Icon name="folder" size={17} /></span><div><b>{displayLibraryName(library)}</b><small>{library.rootPath?.startsWith('session:') ? (hasSessionLibrary(library) ? '临时会话文件' : '原文件需重新添加') : library.rootPath || '导入的索引'}</small></div></div></td><td><span className="type-badge">{library.kind === 'folder' ? '文件夹' : library.kind === 'imported' ? '导入' : '文件'}</span></td><td>{libraryFiles.length}</td><td><div className="progress-cell"><div className="progress-track"><i style={{ width: `${totalCount ? Math.round(doneCount / totalCount * 100) : libraryFiles.length ? 100 : 0}%` }} /></div><span>{progressValue ? `${doneCount}/${totalCount}` : `${libraryFiles.filter((file) => file.status === 'ok').length} 已索引`}</span></div>{progressValue?.file && <small className="current-task">{progressValue.file}</small>}</td><td><span className={`state-badge ${mismatch ? 'warning' : progressValue ? 'working' : 'ready'}`}>{mismatch ? t('rebuild') : progressValue?.status || '就绪'}</span></td><td><div className="table-actions"><button title={progressValue?.status === '已暂停' ? t('resume') : t('pause')} disabled={!indexers.current.has(library.id)} onClick={() => progressValue?.status === '已暂停' ? indexers.current.get(library.id)?.resume() : indexers.current.get(library.id)?.pause()}>{progressValue?.status === '已暂停' ? '▶' : 'Ⅱ'}</button><button title={canRescan ? t('rescan') : '原文件需重新添加后才能扫描'} disabled={!canRescan} onClick={() => void startIndexing(library)}>↻</button><button title={t('export')} onClick={() => void beginExport(library)}>⇩</button><button title={t('remove')} onClick={() => void remove(library)}>×</button></div></td></tr>
               })}
               {!libraries.length && <tr><td className="table-empty" colSpan={6}>还没有索引库。添加文件或导入 .gsidx 索引包开始。</td></tr>}
             </tbody></table></div>
@@ -565,9 +608,9 @@ function App() {
                 <SettingRow title="启用模态" hint="关闭未使用的编码器以减少下载和内存。"><div className="toggle-row"><label><input type="checkbox" checked={settings.modalities.vision} onChange={(event) => updateSettings({ modalities: { ...settings.modalities, vision: event.target.checked } })} />图片与视频</label><label><input type="checkbox" checked={settings.modalities.audio} onChange={(event) => updateSettings({ modalities: { ...settings.modalities, audio: event.target.checked } })} />音频</label></div></SettingRow>
               </div>
               <div className="setting-section"><h2>索引性能</h2><SettingRow title="视频片段" hint="视频按时间段抽帧并分别编码。"><select value={settings.videoSegmentSec} onChange={(event) => updateSettings({ videoSegmentSec: Number(event.target.value) as Settings['videoSegmentSec'] })}><option value={8}>8 秒</option><option value={16}>16 秒</option></select></SettingRow><SettingRow title="音频片段" hint="长音频拆分为连续片段。"><select value={settings.audioSegmentSec} onChange={(event) => updateSettings({ audioSegmentSec: Number(event.target.value) as Settings['audioSegmentSec'] })}><option value={30}>30 秒</option><option value={60}>60 秒</option></select></SettingRow><SettingRow title="索引速度" hint="低速会在批次间增加间隔。"><select value={settings.indexSpeed} onChange={(event) => updateSettings({ indexSpeed: event.target.value as Settings['indexSpeed'] })}><option value="low">低 · 200 ms</option><option value="mid">中 · 50 ms</option><option value="high">高 · 无间隔</option></select></SettingRow></div>
-              <div className="setting-section"><h2>界面与网络</h2><SettingRow title="模型来源" hint="可切换 Hugging Face 镜像站点。"><select value={settings.modelHost} onChange={(event) => updateSettings({ modelHost: event.target.value as Settings['modelHost'] })}><option value="hf">Hugging Face</option><option value="mirror">HF Mirror</option></select></SettingRow><SettingRow title={t('language')}><select value={settings.lang} onChange={(event) => updateSettings({ lang: event.target.value as Settings['lang'] })}><option value="zh">简体中文</option><option value="en">English</option></select></SettingRow></div>
+              <div className="setting-section"><h2>界面与网络</h2><SettingRow title="模型来源" hint="自动优先 Hugging Face，连接失败时回退到镜像。"><select value={settings.modelHost} onChange={(event) => updateSettings({ modelHost: event.target.value as Settings['modelHost'] })}><option value="auto">自动（优先 Hugging Face，连不上时用镜像）</option><option value="mirror">HF Mirror（hf-mirror.com）</option></select></SettingRow><SettingRow title={t('language')}><select value={settings.lang} onChange={(event) => updateSettings({ lang: event.target.value as Settings['lang'] })}><option value="zh">简体中文</option><option value="en">English</option></select></SettingRow></div>
             </div><aside className="settings-aside">
-              <div className="panel backend-panel"><div className="panel-header"><h3>运行状态</h3><span className={`state-badge ${engineStatus ? 'ready' : ''}`}>{engineStatus ? `${engineStatus.backend} · ${engineStatus.profile}` : '未加载'}</span></div><dl><dt>设备</dt><dd>{engineStatus?.adapter || (engineStatus?.backend === 'wasm' ? 'CPU' : '—')}</dd><dt>模型精度</dt><dd>{activeDtype.model}</dd><dt>模型加载</dt><dd>{engineStatus ? `${(engineStatus.loadMs / 1000).toFixed(1)} 秒` : '待启动'}</dd></dl>{engineStatus?.fallbackReason && <p className="fallback-note">{engineStatus.fallbackReason}</p>}</div>
+              <div className="panel backend-panel"><div className="panel-header"><h3>运行状态</h3><span className={`state-badge ${engineStatus ? 'ready' : ''}`}>{engineStatus ? `${engineStatus.backend} · ${engineStatus.profile}` : '未加载'}</span></div><dl><dt>设备</dt><dd>{engineStatus?.adapter || (engineStatus?.backend === 'wasm' ? 'CPU' : '—')}</dd><dt>模型来源</dt><dd>{engineStatus?.modelHost || '—'}</dd><dt>模型精度</dt><dd>{activeDtype.model}</dd><dt>模型加载</dt><dd>{engineStatus ? `${(engineStatus.loadMs / 1000).toFixed(1)} 秒` : '待启动'}</dd></dl>{engineStatus?.fallbackReason && <p className="fallback-note">{engineStatus.fallbackReason}</p>}</div>
               <div className="panel cache-panel"><span className="cache-icon">⌁</span><h3>模型缓存</h3><p>已下载的模型会保存在此浏览器中，清理后下次使用需要重新下载。</p><button className="button secondary full" onClick={async () => { await caches.delete('transformers-cache'); setToast('模型缓存已清理') }}>清理模型缓存</button></div>
               <div className="privacy-card"><b>隐私设计</b><p>文本、媒体和索引向量均在浏览器中处理。联网仅用于首次获取模型文件。</p></div>
             </aside></div>

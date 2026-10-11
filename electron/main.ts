@@ -1,12 +1,13 @@
 import { app, BrowserWindow, dialog, ipcMain, protocol, shell, type WebContents } from 'electron'
 import { randomBytes } from 'node:crypto'
 import { watch, type FSWatcher } from 'chokidar'
-import { createReadStream } from 'node:fs'
+import { createReadStream, watch as watchNative, type FSWatcher as NativeFSWatcher } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { mkdir, readdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
-import { basename, extname, join, relative, resolve, sep } from 'node:path'
+import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
+import { basename, extname, join, relative, resolve } from 'node:path'
 import { Readable } from 'node:stream'
 import { isPathAllowed, isPathInside, parseByteRange } from './security.js'
+import { isIgnoredName, walkFiles } from './fs-walk.js'
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -16,7 +17,7 @@ protocol.registerSchemesAsPrivileged([
 ])
 
 type ListJob = { sender: WebContents; canceled: boolean }
-type WatchRegistration = { sender: WebContents; watcher: FSWatcher }
+type WatchRegistration = { sender: WebContents; watcher: { close(): Promise<void> } }
 
 const authorizedRoots = new Set<string>()
 let registeredRoots = new Set<string>()
@@ -111,26 +112,6 @@ async function resolveRegisteredFile(candidate: string): Promise<string | undefi
     return canonicalFile
   } catch {
     return undefined
-  }
-}
-
-function fileEntry(root: string, absolute: string, size: number, mtime: number): { path: string; name: string; size: number; mtime: number } {
-  const path = relative(root, absolute).split(sep).join('/')
-  return { path, name: basename(absolute), size, mtime }
-}
-
-async function* walkFiles(root: string, prefix = ''): AsyncGenerator<{ path: string; name: string; size: number; mtime: number }> {
-  const directory = prefix ? join(root, prefix) : root
-  for (const entry of await readdir(directory, { withFileTypes: true })) {
-    if (entry.name.startsWith('.') || entry.name === 'node_modules') continue
-    const childPath = prefix ? `${prefix}/${entry.name}` : entry.name
-    if (entry.isDirectory()) {
-      yield* walkFiles(root, childPath)
-    } else if (entry.isFile()) {
-      const absolute = join(root, childPath)
-      const details = await stat(absolute)
-      yield fileEntry(root, absolute, details.size, details.mtimeMs)
-    }
   }
 }
 
@@ -324,13 +305,13 @@ function registerIpcHandlers(): void {
     const configuredPath = process.env.GEMMA_E2E_PICK_FOLDER
     if (configuredPath) {
       const rootPath = await authorizeRoot(configuredPath)
-      return { name: basename(rootPath), rootPath }
+      return { name: basename(rootPath) || rootPath, rootPath }
     }
     const result = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] })
     const selectedPath = result.canceled ? undefined : result.filePaths[0]
     if (!selectedPath) return null
     const rootPath = await authorizeRoot(selectedPath)
-    return { name: basename(rootPath), rootPath }
+    return { name: basename(rootPath) || rootPath, rootPath }
   })
 
   ipcMain.handle('gemma:register-roots', async (_event, values: unknown) => {
@@ -400,34 +381,82 @@ function registerIpcHandlers(): void {
     const rootPath = await resolveRegisteredDirectory(root)
     const existing = watchers.get(libraryId)
     if (existing) await existing.watcher.close()
-    const watcher = watch(rootPath, {
-      ignoreInitial: true,
-      awaitWriteFinish: { stabilityThreshold: 500, pollInterval: 100 },
-      ignored: (value) => value.split(sep).some((part) => part.startsWith('.') || part === 'node_modules'),
-    })
-    const registration: WatchRegistration = { sender: event.sender, watcher }
-    watchers.set(libraryId, registration)
-    watcher.on('all', async (type, changedPath) => {
-      if (type !== 'add' && type !== 'change' && type !== 'unlink') return
-      if (registration.sender.isDestroyed()) return
-      const relativePath = relative(rootPath, changedPath).split(sep).join('/')
-      if (!relativePath || relativePath.startsWith('..')) return
-      const details = type === 'unlink' ? undefined : await stat(changedPath).catch(() => undefined)
+    const pendingEvents = new Map<string, ReturnType<typeof setTimeout>>()
+    let nativeWatcher: NativeFSWatcher | undefined
+    let chokidarWatcher: FSWatcher | undefined
+
+    const clearPendingEvents = () => {
+      for (const timer of pendingEvents.values()) clearTimeout(timer)
+      pendingEvents.clear()
+    }
+
+    const emitFileEvent = async (relativePath: string, preferredType?: 'add' | 'change' | 'unlink') => {
+      if (watchers.get(libraryId) !== registration || registration.sender.isDestroyed()) return
+      const absolute = join(rootPath, ...relativePath.split('/'))
+      const details = await stat(absolute).catch(() => undefined)
+      if (details && !details.isFile()) return
       registration.sender.send('gemma:watch:event', {
         libraryId,
         event: {
-          type,
+          type: details ? (preferredType === 'add' ? 'add' : 'change') : 'unlink',
           path: relativePath,
-          name: basename(changedPath),
+          name: basename(absolute),
           size: details?.size,
           mtime: details?.mtimeMs,
         },
       })
-    })
+    }
+
+    const normalizeRelativePath = (value: string): string | undefined => {
+      const normalized = value.split(/[\\/]/).filter(Boolean).join('/')
+      if (!normalized || normalized.split('/').some((part) => part === '..' || isIgnoredName(part))) return undefined
+      return normalized
+    }
+
+    const watcher = {
+      async close() {
+        clearPendingEvents()
+        if (nativeWatcher) nativeWatcher.close()
+        if (chokidarWatcher) await chokidarWatcher.close()
+      },
+    }
+    const registration: WatchRegistration = { sender: event.sender, watcher }
+    watchers.set(libraryId, registration)
+
+    if (process.platform === 'win32' || process.platform === 'darwin') {
+      nativeWatcher = watchNative(rootPath, { recursive: true }, (_eventType, filename) => {
+        if (filename === null) return
+        const relativePath = normalizeRelativePath(filename.toString())
+        if (!relativePath) return
+        const previous = pendingEvents.get(relativePath)
+        if (previous) clearTimeout(previous)
+        pendingEvents.set(relativePath, setTimeout(() => {
+          pendingEvents.delete(relativePath)
+          void emitFileEvent(relativePath)
+        }, 500))
+      })
+      nativeWatcher.on('error', (error) => console.warn('[GemmaSearch] native watcher error', rootPath, error))
+    } else {
+      chokidarWatcher = watch(rootPath, {
+        ignoreInitial: true,
+        awaitWriteFinish: { stabilityThreshold: 500, pollInterval: 100 },
+        ignored: (value) => value.split(/[\\/]/).some(isIgnoredName),
+      })
+      chokidarWatcher.on('error', (error) => console.warn('[GemmaSearch] chokidar watcher error', rootPath, error))
+      chokidarWatcher.on('all', (type, changedPath) => {
+        if (type !== 'add' && type !== 'change' && type !== 'unlink') return
+        const relativePath = normalizeRelativePath(relative(rootPath, changedPath))
+        if (!relativePath) return
+        void emitFileEvent(relativePath, type)
+      })
+    }
+
     event.sender.once('destroyed', () => {
       if (watchers.get(libraryId) === registration) {
         watchers.delete(libraryId)
-        void watcher.close()
+        void registration.watcher.close().catch((error: unknown) => {
+          console.warn('[GemmaSearch] watcher close failed', rootPath, error)
+        })
       }
     })
   })
